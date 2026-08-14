@@ -19,3 +19,7 @@ You are done.
 1. Delete this folder.
 2. Remove the line about server start guard from the opencode settings file.
 3. Restart opencode.
+
+## One known issue
+
+On Windows, a helper agent can stay stuck after it starts a server, even though the server itself runs fine. This is a problem in opencode on Windows, not in this add-on. The server keeps working while the helper agent is stuck.
