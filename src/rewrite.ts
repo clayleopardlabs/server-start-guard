@@ -109,6 +109,11 @@ export function rewrite(
   const ts = Date.now();
   const outLog = path.join(dir, `${baseName(command)}-${ts}.out.log`);
   const errLog = path.join(dir, `${baseName(command)}-${ts}.err.log`);
+  // stdin must be redirected too: an inherited write-end stdin pipe is what
+  // keeps the original bash tool call open. Start-Process rejects device
+  // paths (e.g. NUL), so give it a real empty file (like </dev/null).
+  const inLog = path.join(dir, `${baseName(command)}-${ts}.in.txt`);
+  fs.writeFileSync(inLog, "");
 
   // Script executes in a fresh pwsh: cd to workdir, then run the original
   // command verbatim. Encoded as UTF-16LE base64 (-EncodedCommand).
@@ -117,7 +122,8 @@ export function rewrite(
 
   return (
     `Write-Output '[server-start-guard] detached server start -> ${outLog}'; ` +
-    `Start-Process pwsh -NoProfile -ArgumentList '-NoProfile','-EncodedCommand',${encoded} ` +
+    `Start-Process pwsh -ArgumentList '-NoProfile','-EncodedCommand',${encoded} ` +
+    `-RedirectStandardInput '${inLog}' ` +
     `-RedirectStandardOutput '${outLog}' -RedirectStandardError '${errLog}'`
   );
 }
