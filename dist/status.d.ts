@@ -1,3 +1,4 @@
+import { type HttpProbeKind } from "./health.js";
 import type { ServerStartGuardConfig } from "./types.js";
 /**
  * Status probes — the lazy, cross-platform observability half of the guard.
@@ -7,8 +8,8 @@ import type { ServerStartGuardConfig } from "./types.js";
  * `<stem>-<ts>.pid` file. On EVERY subsequent bash call the hook runs
  * `probeServers` (in-process, no child processes) against the state dir and
  * prepends a plain `echo`/`Write-Output` with any ANNOUNCEMENTS — before still
- * doing the pid existence check, the probe actively checks HTTP health when a
- * health URL was resolved for the server.
+ * doing the pid existence check. The probe also actively checks HTTP health
+ * when a probe URL can be resolved for the server.
  *
  * This replaces the older design of embedding a raw shell probe into the
  * command. Running the probe in the plugin's own process (Node) is strictly
@@ -26,11 +27,22 @@ import type { ServerStartGuardConfig } from "./types.js";
  *   - DIED      — pid gone     (reported once, then state removed)
  *   - STALLED   — alive but no log write for STALLED_MS (answered once; a
  *                 later log write flips this back and announces RECOVERED)
- *   - UNHEALTHY — alive but the health URL answered 5xx/connection-error
- *                 (answered once per episode; a later 2xx/3xx/4xx announces
- *                 RECOVERED)
+ *   - UNHEALTHY — pid alive and past the boot grace, but for STALLED_MS there
+ *                 has been NO last successful HTTP response (a real <500 from
+ *                 the address families the server actually bound). A single
+ *                 probe failure — timeout OR refused — is NOT a diagnosis on
+ *                 its own (recompiles and slow boots pause a server well
+ *                 inside the window); only a stale last-good response
+ *                 escalates. Announced once per episode; the next real <500
+ *                 response announces RECOVERED.
  *   - RECOVERED — server that was STALLED or UNHEALTHY is healthy again
  * Healthy servers are silent.
+ *
+ * Last-successful-response semantics are the whole point of the health half:
+ * we never track "did the last probe happen to succeed", we track "when was
+ * the last real <500 response". That single timestamp survives recompiles
+ * (slow builds just age it) and separates a genuinely broken server from one
+ * absorbed in a single slow request.
  */
 /** Only announce "stalled" when NO log write happened for this window. */
 export declare const STALLED_MS: number;
@@ -41,8 +53,24 @@ export interface ServerSidecar {
     outLog: string;
     errLog: string;
     healthUrl?: string;
-    /** Last HTTP status bucket: undefined = never probed, "ok" = answered <500. */
-    health?: "ok" | "bad";
+    /**
+     * Effective probe URL. Starts as the rewrite-time guess (`healthUrl`), then
+     * is replaced by the address the server printed in its own logs when one is
+     * discovered (a moved port, dual-stack bind, etc.). Persisted so an UNHEALTHY
+     * announcement cites the URL that actually got probed.
+     */
+    probeUrl?: string;
+    /**
+     * ms timestamp of the LAST real HTTP response < 500. Undefined = the server
+     * has never answered a health probe. This is the escalation clock: nothing
+     * is ever declared UNHEALTHY while this is fresh, no matter what the latest
+     * single probe said.
+     */
+    lastGoodAt?: number;
+    /** Kind of the most recent failed probe (for richer messages). */
+    lastFail?: HttpProbeKind | "err";
+    /** UNHEALTHY already announced for the current bad episode. */
+    reportedUnhealthy?: boolean;
     /** STALLED already announced for the current quiet episode. */
     reportedStalled?: boolean;
     /** Last time we did an HTTP probe of this server (throttle). */

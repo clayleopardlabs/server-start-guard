@@ -35,12 +35,21 @@ The guard also watches over servers it detached. Every time the assistant runs a
 
 - **servername DIED** — the server process is gone. Reported once; its tracking files are cleaned up immediately afterwards.
 - **servername STALLED** — the server process is still running, but it has not written to its log for 2 minutes (a possible "returned but went quiet" case). A later log write reports "recovered".
-- **servername UNHEALTHY** — the server process is running, but it is not actually serving: the health check got no response or an HTTP error (5xx). This catches the state a pid check cannot — a process that is alive but answering 500s on every route.
+- **servername UNHEALTHY** — the server process is running, but it has not returned a single good HTTP response (a real `<500` status) for 2 minutes. A lone slow request, recompile, or late boot does **not** trigger this — only a *stale last-successful response* does, so a server pausing for a rebuild is never mistaken for a dead one.
 - **servername RECOVERED** — a server that was stalled or unhealthy is healthy again.
 
 Healthy servers are silent, so the guard never spams "still running" on every command. A server is only watched from startup until it dies or is explicitly stopped.
 
-When the command mentions a well-known dev server (vite, Angular, Next, Python/uvicorn/django, and a few more), the guard guesses the port and probes it. For anything else, or to be exact, add an explicit URL in the config (below) — the health check is optional and only as good as the URL it is told to check.
+### How the health check finds the right port
+
+Health probing is last-successful-response based: the guard tracks *when the last real `<500` answer arrived*, and only escalates to UNHEALTHY once that goes stale (2 minutes). The probe target is chosen in this order:
+
+1. **The port the server printed in its own logs** (authoritative). Dev servers increment their port when the requested one is taken, so a stale instance can hold the guessed port while the real process serves elsewhere — grabbing the URL the process itself announced sidesteps that entirely.
+2. An explicit `healthChecks` rule whose pattern matches the command.
+3. A built-in guess for well-known dev servers (vite, Angular, Next, Python/uvicorn/django, and a few more).
+4. None of the above — pure pid + log monitoring.
+
+Every probe also covers **both loopback address families** (IPv4 `127.0.0.1` and IPv6 `::1`), so a server that binds only one family is still reachable. A timeout is recorded as a distinct failure kind from a refused connection, but neither one by itself declares a server unhealthy — only the stale last-successful-response clock does.
 
 ## Configuration
 
@@ -55,8 +64,8 @@ Settings live in `~/.config/opencode/plugins/server-start-guard/config.json` and
     { "pattern": "npm run dev", "url": "http://localhost:8080" }
   ]
   ```
-- `defaultHealthChecks` (bool, default `true`) — off (`false`) disables the built-in port guesses; then only explicit `healthChecks` rules and pid/log monitoring apply.
-- `healthTimeoutMs` (default `2000`) — how long each health request may take before the server counts as unresponsive.
+- `defaultHealthChecks` (bool, default `true`) — off (`false`) disables the built-in port guesses; then only explicit `healthChecks` rules, URLs printed in the server's own logs, and pid/log monitoring apply.
+- `healthTimeoutMs` (default `2000`) — how long each health request may take before it is recorded as a timeout.
 - `healthIntervalMs` (default `15000`) — minimum time between health probes of the same server.
 - `healthGraceMs` (default `30000`) — how long after startup to wait before the first probe, so a slow-starting server isn't flagged.
 
