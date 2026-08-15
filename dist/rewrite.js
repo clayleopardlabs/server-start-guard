@@ -14,14 +14,18 @@ import * as path from "node:path";
  *     runs correctly.
  */
 /**
- * Commands that may already be a safe, non-hanging server start (i.e. already
- * use RedirectStandardOutput/RedirectStandardError). We skip these so we do
- * not double-wrap an already-safe invocation.
+ * Commands that may already be a safe, non-hanging server start. The whole
+ * stdout/stderr/stdin triad must be redirected: an inherited stdin pipe (the
+ * write-end) is what keeps the original bash call open, so a Start-Process
+ * that redirects only output/error — like opencode agents hand-write far too
+ * often — still hangs. We skip only fully-detached invocations so we do not
+ * double-wrap them.
  */
 function isAlreadySafe(command) {
     if (!/\bStart-Process\b/i.test(command))
         return false;
-    return (/-RedirectStandardOutput\b/i.test(command) &&
+    return (/-RedirectStandardInput\b/i.test(command) &&
+        /-RedirectStandardOutput\b/i.test(command) &&
         /-RedirectStandardError\b/i.test(command));
 }
 /** Conservative, high-confidence server-start patterns (case-insensitive). */
