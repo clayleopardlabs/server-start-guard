@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { ServerStartGuardConfig } from "./types.js";
+import { resolveHealthUrl } from "./health.js";
 import { pidFilePath, stateFilePath, writeSidecar } from "./status.js";
 
 /**
@@ -206,12 +207,15 @@ export function rewrite(
   const errLog = path.join(dir, `${stem}-${ts}.err.log`);
   const pidPath = pidFilePath(dir, stem, ts);
 
+  const healthUrl = resolveHealthUrl(command, cfg);
+
   writeSidecar(stateFilePath(dir, stem, ts), {
     command,
     workdir: cwd,
     startedAt: new Date().toISOString(),
     outLog,
     errLog,
+    ...(healthUrl ? { healthUrl } : {}),
   });
 
   if (IS_WINDOWS) {

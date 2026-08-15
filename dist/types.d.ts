@@ -8,6 +8,12 @@ export declare const PLUGIN_NAME = "server-start-guard";
 export declare const CONFIG_PATH: string;
 /** Default directory for detached server log files. */
 export declare const DEFAULT_LOG_DIR: string;
+export interface HealthCheckRule {
+    /** Substring of the original command that this rule applies to. */
+    pattern: string;
+    /** URL to probe for functional liveness (e.g. http://localhost:5173). */
+    url: string;
+}
 export interface ServerStartGuardConfig {
     /** Global on/off switch. Set false to disable all rewrites. */
     enabled: boolean;
@@ -15,4 +21,17 @@ export interface ServerStartGuardConfig {
     logDir: string;
     /** Optional extra regex substrings of additional commands to treat as servers. */
     extraPatterns: string[];
+    /**
+     * Active HTTP health probes: per-command URL overrides. First rule whose
+     * pattern is a substring of the command wins.
+     */
+    healthChecks: HealthCheckRule[];
+    /** Relative seconds for a preset dev-server port map (true) or off (false). */
+    defaultHealthChecks: boolean;
+    /** Per-request timeout for an HTTP health probe, in milliseconds. */
+    healthTimeoutMs: number;
+    /** Minimum gap between health probes of the same server, in milliseconds. */
+    healthIntervalMs: number;
+    /** Grace period after start before the first probe, in milliseconds. */
+    healthGraceMs: number;
 }

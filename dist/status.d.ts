@@ -1,23 +1,36 @@
+import type { ServerStartGuardConfig } from "./types.js";
 /**
  * Status probes — the lazy, cross-platform observability half of the guard.
  *
  * On detach the rewrite writes a `.state.json` sidecar (schema below) next to
  * the logs, and the launched wrapper records the daemon pid in a sibling
- * `<stem>-<ts>.pid` file. On EVERY subsequent bash call the hook prepends a
- * probe snippet (platform-dispatched like the rewrite) that scans the state
- * dir and announces only CHANGES worth knowing: a server that died, or one
- * that is still alive but stopped writing to its logs (the "returned then
- * went quiet" case that plain liveness misses).
+ * `<stem>-<ts>.pid` file. On EVERY subsequent bash call the hook runs
+ * `probeServers` (in-process, no child processes) against the state dir and
+ * prepends a plain `echo`/`Write-Output` with any ANNOUNCEMENTS — before still
+ * doing the pid existence check, the probe actively checks HTTP health when a
+ * health URL was resolved for the server.
  *
- * This preserves the plugin's fire-and-forget property: no long-lived process
- * is spawned. The agent's own next bash command is the notification channel,
- * so the probe is lazy (discovered then, not pushed) but costs a few
- * milliseconds and reports at exactly the moment the agent would otherwise
- * start checking itself.
+ * This replaces the older design of embedding a raw shell probe into the
+ * command. Running the probe in the plugin's own process (Node) is strictly
+ * more powerful and far less fragile:
+ *   - it can perform real HTTP requests (the only way to catch a process that
+ *     is alive but serving 500s / answering nothing);
+ *   - it has no shell-quoting surface at all — the emitted command is nothing
+ *     but literal `echo`/`Write-Output` lines (plus the original command);
+ *   - it is identical across Windows and POSIX (no Get-Process vs kill -0
+ *     divergence, no `find -mmin` vs LastWriteTime divergence).
  *
- * Dead servers are reported once and their state removed. Healthy servers are
- * silent — only transitions (died / stalled) are announced, so the guard
- * never spams "still running" on every command.
+ * Fire-and-forget is preserved: no long-lived process is spawned. The agent's
+ * own next bash command is the notification channel, so the probe is lazy
+ * (runs then, not pushed). Only TRANSITIONS are announced:
+ *   - DIED      — pid gone     (reported once, then state removed)
+ *   - STALLED   — alive but no log write for STALLED_MS (answered once; a
+ *                 later log write flips this back and announces RECOVERED)
+ *   - UNHEALTHY — alive but the health URL answered 5xx/connection-error
+ *                 (answered once per episode; a later 2xx/3xx/4xx announces
+ *                 RECOVERED)
+ *   - RECOVERED — server that was STALLED or UNHEALTHY is healthy again
+ * Healthy servers are silent.
  */
 /** Only announce "stalled" when NO log write happened for this window. */
 export declare const STALLED_MS: number;
@@ -27,6 +40,13 @@ export interface ServerSidecar {
     startedAt: string;
     outLog: string;
     errLog: string;
+    healthUrl?: string;
+    /** Last HTTP status bucket: undefined = never probed, "ok" = answered <500. */
+    health?: "ok" | "bad";
+    /** STALLED already announced for the current quiet episode. */
+    reportedStalled?: boolean;
+    /** Last time we did an HTTP probe of this server (throttle). */
+    lastProbeAt?: number;
 }
 /** State file for a handoff, named `<stem>-<ts>.state.json`. */
 export declare function stateFilePath(dir: string, stem: string, ts: number): string;
@@ -36,20 +56,22 @@ export declare function pidFilePath(dir: string, stem: string, ts: number): stri
 export declare function writeSidecar(statePath: string, sidecar: ServerSidecar): void;
 /** True when at least one handoff is being tracked in `dir`. */
 export declare function hasTrackedServers(dir: string): boolean;
+export interface ProbeAnnouncement {
+    severity: "died" | "stalled" | "unhealthy" | "recovered";
+    pid: number;
+    display: string;
+    url?: string;
+}
+/** Announcements are returned as a list; buildProbeEcho renders them into `echo ...` lines. */
+export declare function renderAnnouncement(a: ProbeAnnouncement): string;
 /**
- * POSIX (mac/linux) probe. Reports and cleans up died servers; flags stalled
- * ones (pid alive, logs silent for STALLED_MS). `kill -0` for liveness and
- * `find -mmin` for mtime work identically on mac BSD and linux GNU, so this
- * is a single portable snippet.
+ * Scan the state dir and return every announcement for this bash call. Died
+ * servers have their state + pid files removed (reported once and forgotten).
  */
-export declare function buildPosixProbe(stateDir: string): string;
+export declare function probeServers(dir: string, cfg: ServerStartGuardConfig): Promise<ProbeAnnouncement[]>;
 /**
- * Windows (pwsh) probe — the mirror of buildPosixProbe: Get-Process for
- * liveness, LastWriteTime for staleness, Remove-Item for cleanup.
+ * Prepend the notifications to the real command. Produces ONLY literal
+ * echo/Write-Output lines — there is no shell logic embedded, so nothing to
+ * quote-bug. Returns `cmd` unchanged when there is nothing to say.
  */
-export declare function buildWindowsProbe(stateDir: string): string;
-/**
- * Build the probe snippet for the current platform, or "" when no handoff is
- * being tracked (so an idle agent pays nothing extra on every command).
- */
-export declare function buildStatusProbe(stateDir: string): string;
+export declare function buildProbeEcho(announcements: ProbeAnnouncement[], cmd: string, isWindows: boolean): string;

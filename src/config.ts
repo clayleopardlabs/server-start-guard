@@ -6,6 +6,11 @@ function defaults(): ServerStartGuardConfig {
     enabled: true,
     logDir: DEFAULT_LOG_DIR,
     extraPatterns: [],
+    healthChecks: [],
+    defaultHealthChecks: true,
+    healthTimeoutMs: 2000,
+    healthIntervalMs: 15000,
+    healthGraceMs: 30000,
   };
 }
 
@@ -24,6 +29,19 @@ export function readConfig(): ServerStartGuardConfig {
       if (Array.isArray(raw.extraPatterns)) {
         cfg.extraPatterns = raw.extraPatterns.filter((p) => typeof p === "string");
       }
+      if (Array.isArray(raw.healthChecks)) {
+        cfg.healthChecks = raw.healthChecks
+          .filter((h) => h && typeof h === "object")
+          .map((h) => ({
+            pattern: typeof h.pattern === "string" ? h.pattern : "",
+            url: typeof h.url === "string" ? h.url : "",
+          }))
+          .filter((h) => h.pattern !== "" && h.url !== "");
+      }
+      if (typeof raw.defaultHealthChecks === "boolean") cfg.defaultHealthChecks = raw.defaultHealthChecks;
+      if (typeof raw.healthTimeoutMs === "number" && raw.healthTimeoutMs > 0) cfg.healthTimeoutMs = raw.healthTimeoutMs;
+      if (typeof raw.healthIntervalMs === "number" && raw.healthIntervalMs > 0) cfg.healthIntervalMs = raw.healthIntervalMs;
+      if (typeof raw.healthGraceMs === "number" && raw.healthGraceMs > 0) cfg.healthGraceMs = raw.healthGraceMs;
     }
   } catch {
     // malformed/unreadable config -> keep defaults

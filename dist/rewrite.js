@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { resolveHealthUrl } from "./health.js";
 import { pidFilePath, stateFilePath, writeSidecar } from "./status.js";
 /**
  * Detection + rewriting for server-start commands.
@@ -171,12 +172,14 @@ export function rewrite(command, cfg, workdir) {
     const outLog = path.join(dir, `${stem}-${ts}.out.log`);
     const errLog = path.join(dir, `${stem}-${ts}.err.log`);
     const pidPath = pidFilePath(dir, stem, ts);
+    const healthUrl = resolveHealthUrl(command, cfg);
     writeSidecar(stateFilePath(dir, stem, ts), {
         command,
         workdir: cwd,
         startedAt: new Date().toISOString(),
         outLog,
         errLog,
+        ...(healthUrl ? { healthUrl } : {}),
     });
     if (IS_WINDOWS) {
         const inLog = path.join(dir, `${stem}-${ts}.in.txt`);

@@ -31,12 +31,16 @@ Logs land in `%TMP%\opencode\server-logs` (Windows) or `os.tmpdir()/opencode/ser
 
 ## Status reporting
 
-The guard also watches over servers it detached. Every time the assistant runs a `bash` command, a tiny probe checks the tracked servers and mentions only changes worth knowing:
+The guard also watches over servers it detached. Every time the assistant runs a `bash` command, a tiny in-process probe checks the tracked servers and announces only changes worth knowing:
 
 - **servername DIED** — the server process is gone. Reported once; its tracking files are cleaned up immediately afterwards.
-- **servername STALLED** — the server process is still running, but it has not written to its log for 2 minutes (a possible "returned but went quiet" case). This is a heuristic; a healthy but silent server can trigger it.
+- **servername STALLED** — the server process is still running, but it has not written to its log for 2 minutes (a possible "returned but went quiet" case). A later log write reports "recovered".
+- **servername UNHEALTHY** — the server process is running, but it is not actually serving: the health check got no response or an HTTP error (5xx). This catches the state a pid check cannot — a process that is alive but answering 500s on every route.
+- **servername RECOVERED** — a server that was stalled or unhealthy is healthy again.
 
 Healthy servers are silent, so the guard never spams "still running" on every command. A server is only watched from startup until it dies or is explicitly stopped.
+
+When the command mentions a well-known dev server (vite, Angular, Next, Python/uvicorn/django, and a few more), the guard guesses the port and probes it. For anything else, or to be exact, add an explicit URL in the config (below) — the health check is optional and only as good as the URL it is told to check.
 
 ## Configuration
 
@@ -45,6 +49,16 @@ Settings live in `~/.config/opencode/plugins/server-start-guard/config.json` and
 - `enabled` (bool) — turn the guard on or off.
 - `logDir` (string) — where detached servers write their logs (and the guard its tracking files).
 - `extraPatterns` (string[]) — extra substrings; any command containing one is treated as a server start.
+- `healthChecks` (array of `{ "pattern": "...", "url": "..." }`) — explicit health-check URLs. The first rule whose pattern appears in the command wins, e.g. to probe your custom port:
+  ```json
+  "healthChecks": [
+    { "pattern": "npm run dev", "url": "http://localhost:8080" }
+  ]
+  ```
+- `defaultHealthChecks` (bool, default `true`) — off (`false`) disables the built-in port guesses; then only explicit `healthChecks` rules and pid/log monitoring apply.
+- `healthTimeoutMs` (default `2000`) — how long each health request may take before the server counts as unresponsive.
+- `healthIntervalMs` (default `15000`) — minimum time between health probes of the same server.
+- `healthGraceMs` (default `30000`) — how long after startup to wait before the first probe, so a slow-starting server isn't flagged.
 
 ## How to remove
 

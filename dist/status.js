@@ -1,25 +1,38 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { httpStatus } from "./health.js";
 /**
  * Status probes — the lazy, cross-platform observability half of the guard.
  *
  * On detach the rewrite writes a `.state.json` sidecar (schema below) next to
  * the logs, and the launched wrapper records the daemon pid in a sibling
- * `<stem>-<ts>.pid` file. On EVERY subsequent bash call the hook prepends a
- * probe snippet (platform-dispatched like the rewrite) that scans the state
- * dir and announces only CHANGES worth knowing: a server that died, or one
- * that is still alive but stopped writing to its logs (the "returned then
- * went quiet" case that plain liveness misses).
+ * `<stem>-<ts>.pid` file. On EVERY subsequent bash call the hook runs
+ * `probeServers` (in-process, no child processes) against the state dir and
+ * prepends a plain `echo`/`Write-Output` with any ANNOUNCEMENTS — before still
+ * doing the pid existence check, the probe actively checks HTTP health when a
+ * health URL was resolved for the server.
  *
- * This preserves the plugin's fire-and-forget property: no long-lived process
- * is spawned. The agent's own next bash command is the notification channel,
- * so the probe is lazy (discovered then, not pushed) but costs a few
- * milliseconds and reports at exactly the moment the agent would otherwise
- * start checking itself.
+ * This replaces the older design of embedding a raw shell probe into the
+ * command. Running the probe in the plugin's own process (Node) is strictly
+ * more powerful and far less fragile:
+ *   - it can perform real HTTP requests (the only way to catch a process that
+ *     is alive but serving 500s / answering nothing);
+ *   - it has no shell-quoting surface at all — the emitted command is nothing
+ *     but literal `echo`/`Write-Output` lines (plus the original command);
+ *   - it is identical across Windows and POSIX (no Get-Process vs kill -0
+ *     divergence, no `find -mmin` vs LastWriteTime divergence).
  *
- * Dead servers are reported once and their state removed. Healthy servers are
- * silent — only transitions (died / stalled) are announced, so the guard
- * never spams "still running" on every command.
+ * Fire-and-forget is preserved: no long-lived process is spawned. The agent's
+ * own next bash command is the notification channel, so the probe is lazy
+ * (runs then, not pushed). Only TRANSITIONS are announced:
+ *   - DIED      — pid gone     (reported once, then state removed)
+ *   - STALLED   — alive but no log write for STALLED_MS (answered once; a
+ *                 later log write flips this back and announces RECOVERED)
+ *   - UNHEALTHY — alive but the health URL answered 5xx/connection-error
+ *                 (answered once per episode; a later 2xx/3xx/4xx announces
+ *                 RECOVERED)
+ *   - RECOVERED — server that was STALLED or UNHEALTHY is healthy again
+ * Healthy servers are silent.
  */
 /** Only announce "stalled" when NO log write happened for this window. */
 export const STALLED_MS = 2 * 60 * 1000;
@@ -51,59 +64,173 @@ export function hasTrackedServers(dir) {
         return false;
     }
 }
-/** Escape a string for safe inclusion inside single quotes in a POSIX shell. */
-function shq(s) {
-    return s.replace(/'/g, `'\\''`);
+function readSidecar(statePath) {
+    try {
+        return JSON.parse(fs.readFileSync(statePath, "utf-8"));
+    }
+    catch {
+        return undefined;
+    }
+}
+function readPid(pidPath) {
+    try {
+        const raw = fs.readFileSync(pidPath, "utf-8").trim();
+        const m = raw.match(/\d+/);
+        return m ? Number(m[0]) : 0;
+    }
+    catch {
+        return 0;
+    }
 }
 /**
- * POSIX (mac/linux) probe. Reports and cleans up died servers; flags stalled
- * ones (pid alive, logs silent for STALLED_MS). `kill -0` for liveness and
- * `find -mmin` for mtime work identically on mac BSD and linux GNU, so this
- * is a single portable snippet.
+ * Cross-platform pid existence check entirely in-process. ESRCH = gone;
+ * EPERM (exists but not ours) counts as alive.
  */
-export function buildPosixProbe(stateDir) {
-    const sd = shq(stateDir);
-    const m = Math.round(STALLED_MS / 60000);
-    return (`for f in '${sd}'/*.state.json; do ` +
-        `[ -e "$f" ] || continue; b="${'${f%.state.json}'}"; ` +
-        `[ -f "$b.pid" ] || continue; p=$(cat "$b.pid" 2>/dev/null); ` +
-        `case "$p" in ''|0|*[!0-9]*) continue;; esac; ` +
-        `if kill -0 "$p" 2>/dev/null; then ` +
-        `if { [ -f "$b.out.log" ] || [ -f "$b.err.log" ]; } && [ -z "$(find "$b.out.log" "$b.err.log" -mmin -${m} 2>/dev/null)" ]; then ` +
-        `echo "[server-start-guard] server STALLED (pid $p, no log writes in ${m}m): $b"; fi; ` +
-        `else echo "[server-start-guard] server DIED (pid $p): $b"; rm -f "$f" "$b.pid"; fi; ` +
-        `done`);
+function isAlive(pid) {
+    try {
+        process.kill(pid, 0);
+        return true;
+    }
+    catch (err) {
+        return err.code === "EPERM";
+    }
+}
+/** Newest LastWriteTime among the server's existing log files, or 0. */
+function newestLogWrite(sidecar) {
+    let newest = 0;
+    for (const log of [sidecar.outLog, sidecar.errLog]) {
+        try {
+            const t = fs.statSync(log).mtimeMs;
+            if (t > newest)
+                newest = t;
+        }
+        catch {
+            // log file may not exist yet after a fresh detach
+        }
+    }
+    return newest;
+}
+async function probeOne(statePath, sidecar, pid, cfg) {
+    const now = Date.now();
+    const display = statePath.replace(/\.state\.json$/i, "");
+    const out = [];
+    if (!isAlive(pid)) {
+        return [{ severity: "died", pid, display }];
+    }
+    let changed = false;
+    // 1. Staleness: alive but silent for STALLED_MS -> STALLED once; recovery = RECOVERED.
+    const newest = newestLogWrite(sidecar);
+    if (newest > 0 && now - newest >= STALLED_MS) {
+        if (!sidecar.reportedStalled) {
+            sidecar.reportedStalled = true;
+            changed = true;
+            out.push({ severity: "stalled", pid, display });
+        }
+    }
+    else if (sidecar.reportedStalled && newest > 0) {
+        sidecar.reportedStalled = false;
+        changed = true;
+        out.push({ severity: "recovered", pid, display });
+    }
+    // 2. Active HTTP health — only when a URL was resolved, past the boot grace
+    // period, and throttled to one probe per healthIntervalMs.
+    if (sidecar.healthUrl) {
+        const startedMs = Date.parse(sidecar.startedAt) || now;
+        const ageOk = now - startedMs >= cfg.healthGraceMs;
+        const throttle = sidecar.lastProbeAt === undefined || now - sidecar.lastProbeAt >= cfg.healthIntervalMs;
+        if (ageOk && throttle) {
+            const status = await httpStatus(sidecar.healthUrl, cfg.healthTimeoutMs);
+            const bad = status === null || status >= 500;
+            sidecar.lastProbeAt = now;
+            changed = true;
+            if (bad && sidecar.health !== "bad") {
+                sidecar.health = "bad";
+                out.push({
+                    severity: "unhealthy",
+                    pid,
+                    display,
+                    url: `${sidecar.healthUrl} (${status === null ? "no response" : `HTTP ${status}`})`,
+                });
+            }
+            else if (!bad && sidecar.health !== "ok") {
+                const recovered = sidecar.health === "bad";
+                sidecar.health = "ok";
+                if (recovered) {
+                    out.push({ severity: "recovered", pid, display, url: sidecar.healthUrl });
+                }
+            }
+        }
+    }
+    if (changed)
+        writeSidecar(statePath, sidecar);
+    return out;
+}
+/** Announcements are returned as a list; buildProbeEcho renders them into `echo ...` lines. */
+export function renderAnnouncement(a) {
+    switch (a.severity) {
+        case "died":
+            return `[server-start-guard] server DIED (pid ${a.pid}): ${a.display}`;
+        case "stalled":
+            return `[server-start-guard] server STALLED (pid ${a.pid}, no log writes in ${Math.round(STALLED_MS / 60000)}m): ${a.display}`;
+        case "unhealthy":
+            return `[server-start-guard] server UNHEALTHY (pid ${a.pid}): ${a.display} @ ${a.url}`;
+        case "recovered":
+            return a.url
+                ? `[server-start-guard] server RECOVERED (pid ${a.pid}): ${a.display} @ ${a.url}`
+                : `[server-start-guard] server RECOVERED (pid ${a.pid}): ${a.display}`;
+    }
 }
 /**
- * Windows (pwsh) probe — the mirror of buildPosixProbe: Get-Process for
- * liveness, LastWriteTime for staleness, Remove-Item for cleanup.
+ * Scan the state dir and return every announcement for this bash call. Died
+ * servers have their state + pid files removed (reported once and forgotten).
  */
-export function buildWindowsProbe(stateDir) {
-    const sd = stateDir.replace(/'/g, "''");
-    const m = Math.round(STALLED_MS / 60000);
-    return (`foreach ($s in Get-ChildItem '${sd}' -Filter '*.state.json' -ErrorAction SilentlyContinue) { ` +
-        `$b = $s.FullName -replace '\\.state.json$',''; ` +
-        `$pidf = "\${b}.pid"; $p = 0; ` +
-        `if (Test-Path -LiteralPath $pidf) { $raw = (Get-Content -LiteralPath $pidf -Raw).Trim(); if ($raw -match '\\d') { $p = [int]($raw -replace '\\D','') } }; ` +
-        `if ($p -le 0) { continue }; ` +
-        `if (Get-Process -Id $p -ErrorAction SilentlyContinue) { ` +
-        `$logs = @("\${b}.out.log","\${b}.err.log") | Where-Object { Test-Path -LiteralPath $_ }; ` +
-        `if ($logs.Count -gt 0) { ` +
-        `$last = ($logs | ForEach-Object { (Get-Item -LiteralPath $_).LastWriteTime } | Sort-Object -Descending | Select-Object -First 1); ` +
-        `if ($last -and (Get-Date) -gt $last.AddMinutes(${m})) { Write-Output "[server-start-guard] server STALLED (pid $p, no log writes in ${m}m): $b" } ` +
-        `} } else { ` +
-        `Write-Output "[server-start-guard] server DIED (pid $p): $b"; ` +
-        `Remove-Item -LiteralPath "\${b}.pid","\${b}.state.json" -Force -ErrorAction SilentlyContinue ` +
-        `} }`);
+export async function probeServers(dir, cfg) {
+    let files;
+    try {
+        files = fs.readdirSync(dir);
+    }
+    catch {
+        return [];
+    }
+    const announcements = [];
+    for (const f of files) {
+        if (!f.toLowerCase().endsWith(".state.json"))
+            continue;
+        const statePath = path.join(dir, f);
+        const sidecar = readSidecar(statePath);
+        if (!sidecar)
+            continue;
+        const pidPath = statePath.replace(/\.state\.json$/i, "") + ".pid";
+        const pid = readPid(pidPath);
+        // Wrapper may not have written the pid file yet on a very fresh detach.
+        if (pid <= 0)
+            continue;
+        const list = await probeOne(statePath, sidecar, pid, cfg);
+        for (const ann of list) {
+            announcements.push(ann);
+            if (ann.severity === "died") {
+                try {
+                    fs.unlinkSync(statePath);
+                    fs.unlinkSync(pidPath);
+                }
+                catch {
+                    // already gone — fine
+                }
+            }
+        }
+    }
+    return announcements;
 }
-const IS_WINDOWS = typeof process !== "undefined" && process.platform === "win32";
 /**
- * Build the probe snippet for the current platform, or "" when no handoff is
- * being tracked (so an idle agent pays nothing extra on every command).
+ * Prepend the notifications to the real command. Produces ONLY literal
+ * echo/Write-Output lines — there is no shell logic embedded, so nothing to
+ * quote-bug. Returns `cmd` unchanged when there is nothing to say.
  */
-export function buildStatusProbe(stateDir) {
-    if (!hasTrackedServers(stateDir))
-        return "";
-    return IS_WINDOWS ? buildWindowsProbe(stateDir) : buildPosixProbe(stateDir);
+export function buildProbeEcho(announcements, cmd, isWindows) {
+    if (announcements.length === 0)
+        return cmd;
+    const quotes = (s) => (isWindows ? `'${s.replace(/'/g, "''")}'` : `'${s.replace(/'/g, `'\\''`)}'`);
+    const lines = announcements.map((a) => (`${isWindows ? "Write-Output" : "echo"} ${quotes(renderAnnouncement(a))}`));
+    return `${lines.join("; ")}; ${cmd}`;
 }
 //# sourceMappingURL=status.js.map

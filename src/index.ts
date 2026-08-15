@@ -1,7 +1,7 @@
 import { Plugin } from "@opencode-ai/plugin";
 import { readConfig } from "./config.js";
 import { detect, resolveLogDir, rewrite } from "./rewrite.js";
-import { buildStatusProbe } from "./status.js";
+import { buildProbeEcho, probeServers } from "./status.js";
 
 /**
  * server-start-guard — enforces the "never start a server in the foreground"
@@ -46,14 +46,18 @@ export const ServerStartGuardPlugin: Plugin = async () => {
       }
 
       // Every bash call (not just server starts) is a free chance to report
-      // how previously-detached servers are doing.
+      // how previously-detached servers are doing. The probe runs in-process
+      // (pid + log-staleness + optional HTTP health), then prepends only
+      // literal echo/Write-Output lines announcing CHANGES.
       const dir = resolveLogDir(cfg);
-      const probe = buildStatusProbe(dir);
-      if (probe !== "") {
-        cmd = `${probe}; ${cmd}`;
-      }
+      const announcements = await probeServers(dir, cfg);
+      cmd = buildProbeEcho(announcements, cmd, isWindows());
 
       output.args.command = cmd;
     },
   };
 };
+
+function isWindows(): boolean {
+  return typeof process !== "undefined" && process.platform === "win32";
+}
