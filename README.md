@@ -8,11 +8,43 @@ When the assistant starts a long running program like a server, this add-on quie
 
 ## How to install
 
+**Windows**
 1. Download this folder onto your computer.
 2. Double click the file named `install.bat`.
 3. Restart opencode.
 
+**macOS / Linux**
+1. Download this folder onto your computer.
+2. Run `./install.sh` from the folder (`chmod +x install.sh` first if needed).
+3. Restart opencode.
+
 You are done.
+
+## What happens when a server starts
+
+The server command is rewritten into a detached form with all of its input and output redirected to log files, so the `bash` call returns immediately:
+
+- **Windows:** a second `pwsh` is launched with the original command encoded (`-EncodedCommand`, base64 UTF-16LE), with stdout/stderr/stdin redirected to real files and `-PassThru` used to capture the launcher's pid.
+- **macOS / Linux:** the command is single-quote-escaped and run as `nohup sh -c '<command>' </dev/null >out.log 2>err.log &`, with the job's pid captured to a `.pid` file.
+
+Logs land in `%TMP%\opencode\server-logs` (Windows) or `os.tmpdir()/opencode/server-logs` (POSIX), or a custom `logDir` from the config.
+
+## Status reporting
+
+The guard also watches over servers it detached. Every time the assistant runs a `bash` command, a tiny probe checks the tracked servers and mentions only changes worth knowing:
+
+- **servername DIED** — the server process is gone. Reported once; its tracking files are cleaned up immediately afterwards.
+- **servername STALLED** — the server process is still running, but it has not written to its log for 2 minutes (a possible "returned but went quiet" case). This is a heuristic; a healthy but silent server can trigger it.
+
+Healthy servers are silent, so the guard never spams "still running" on every command. A server is only watched from startup until it dies or is explicitly stopped.
+
+## Configuration
+
+Settings live in `~/.config/opencode/plugins/server-start-guard/config.json` and are read again on every command, so edits apply without restarting opencode:
+
+- `enabled` (bool) — turn the guard on or off.
+- `logDir` (string) — where detached servers write their logs (and the guard its tracking files).
+- `extraPatterns` (string[]) — extra substrings; any command containing one is treated as a server start.
 
 ## How to remove
 

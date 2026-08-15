@@ -1,5 +1,6 @@
 import { readConfig } from "./config.js";
-import { detect, rewrite } from "./rewrite.js";
+import { detect, resolveLogDir, rewrite } from "./rewrite.js";
+import { buildStatusProbe } from "./status.js";
 /**
  * server-start-guard — enforces the "never start a server in the foreground"
  * rule mechanically. Detects server-start commands in the `bash` tool and
@@ -15,6 +16,11 @@ import { detect, rewrite } from "./rewrite.js";
  * own tools (`ghidra-mcp_*`, `lmstudio-mcp_*`, ...) that never route through
  * bash, so MCP usage is untouched.
  *
+ * Observability (lazy status): each rewrite seeds a sidecar, and on later bash
+ * calls the hook prepends a probe that announces died / stalled servers. No
+ * long-lived process is spawned — the agent's next bash command is the
+ * notification channel. `buildStatusProbe` no-ops when nothing is tracked.
+ *
  * Gated by an `enabled` flag in the runtime config so it can be disabled if
  * it ever misbehaves.
  */
@@ -29,10 +35,19 @@ export const ServerStartGuardPlugin = async () => {
             const command = output.args?.command;
             if (typeof command !== "string")
                 return;
-            if (!detect(command, cfg))
-                return;
             const workdir = typeof output.args?.workdir === "string" ? output.args.workdir : undefined;
-            output.args.command = rewrite(command, cfg, workdir);
+            let cmd = command;
+            if (detect(command, cfg)) {
+                cmd = rewrite(command, cfg, workdir);
+            }
+            // Every bash call (not just server starts) is a free chance to report
+            // how previously-detached servers are doing.
+            const dir = resolveLogDir(cfg);
+            const probe = buildStatusProbe(dir);
+            if (probe !== "") {
+                cmd = `${probe}; ${cmd}`;
+            }
+            output.args.command = cmd;
         },
     };
 };

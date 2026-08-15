@@ -14,6 +14,11 @@ import { Plugin } from "@opencode-ai/plugin";
  * own tools (`ghidra-mcp_*`, `lmstudio-mcp_*`, ...) that never route through
  * bash, so MCP usage is untouched.
  *
+ * Observability (lazy status): each rewrite seeds a sidecar, and on later bash
+ * calls the hook prepends a probe that announces died / stalled servers. No
+ * long-lived process is spawned — the agent's next bash command is the
+ * notification channel. `buildStatusProbe` no-ops when nothing is tracked.
+ *
  * Gated by an `enabled` flag in the runtime config so it can be disabled if
  * it ever misbehaves.
  */

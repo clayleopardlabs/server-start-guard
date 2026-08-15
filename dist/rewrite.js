@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { pidFilePath, stateFilePath, writeSidecar } from "./status.js";
 /**
  * Detection + rewriting for server-start commands.
  *
@@ -14,19 +15,40 @@ import * as path from "node:path";
  *     runs correctly.
  */
 /**
- * Commands that may already be a safe, non-hanging server start. The whole
- * stdout/stderr/stdin triad must be redirected: an inherited stdin pipe (the
- * write-end) is what keeps the original bash call open, so a Start-Process
- * that redirects only output/error — like opencode agents hand-write far too
- * often — still hangs. We skip only fully-detached invocations so we do not
- * double-wrap them.
+ * The detachment primitive is platform-specific:
+ *   - Windows (pwsh):  Start-Process pwsh -EncodedCommand ... with
+ *     -RedirectStandardInput/-Output/-Error. base64 UTF-16LE avoids
+ *     shell-quoting hazards.
+ *   - POSIX (mac/linux, bash/sh): single-quote-escape the original command
+ *     and run it under `nohup sh -c '...' </dev/null >log 2>log &`. nohup
+ *     ignores SIGHUP; /dev/null (not a device-path problem here) closes stdin;
+ *     the `&` background job's redirected streams close the tool's pipe so the
+ *     bash call returns immediately.
+ */
+const IS_WINDOWS = typeof process !== "undefined" && process.platform === "win32";
+/** Escape a string for safe inclusion inside single quotes in a POSIX shell. */
+function shq(s) {
+    return s.replace(/'/g, `'\\''`);
+}
+/**
+ * Commands that may already be a safe, non-hanging server start:
+ *   - Windows: Start-Process must redirect the whole stdout/stderr/stdin
+ *     triad — an inherited stdin pipe (the write-end) is what keeps the
+ *     original bash call open, so out+err-only still hangs.
+ *   - POSIX: a nohup background job that already redirects a stream and ends
+ *     with `&` is considered detached. A bare `nohup server` (no redirect, no
+ *     `&`) is NOT — it still inherits the tool's pipes.
  */
 function isAlreadySafe(command) {
-    if (!/\bStart-Process\b/i.test(command))
-        return false;
-    return (/-RedirectStandardInput\b/i.test(command) &&
-        /-RedirectStandardOutput\b/i.test(command) &&
-        /-RedirectStandardError\b/i.test(command));
+    if (IS_WINDOWS) {
+        return (/\bStart-Process\b/i.test(command) &&
+            /-RedirectStandardInput\b/i.test(command) &&
+            /-RedirectStandardOutput\b/i.test(command) &&
+            /-RedirectStandardError\b/i.test(command));
+    }
+    return (/\bnohup\b/i.test(command) &&
+        /[0-9]?[<>]/.test(command) &&
+        /&\s*(?:#.*)?$/m.test(command));
 }
 /** Conservative, high-confidence server-start patterns (case-insensitive). */
 const BASE_PATTERNS = [
@@ -80,44 +102,87 @@ function baseName(command) {
     return (stem || "server").replace(/[^a-zA-Z0-9_-]/g, "-");
 }
 /**
- * Rewrites a server-start command into a detached, stdio-redirected form so
- * the original bash tool call returns immediately and never freezes on an
- * inherited output pipe. Achieved via a second pwsh process launched with
- * -EncodedCommand (base64, so no shell-quoting hazards), its stdout/stderr
- * redirected to per-invocation log files. On the shell used here (pwsh on
- * Windows) this is the reliable detachment primitive.
+ * Resolve the effective log/state directory for a config, falling back to the
+ * default when the configured one cannot be created. Shared by the rewrite
+ * (writes logs + sidecars) and the status probe (reads them back).
  */
-export function rewrite(command, cfg, workdir) {
+export function resolveLogDir(cfg) {
     let dir = cfg.logDir;
     try {
         fs.mkdirSync(dir, { recursive: true });
     }
     catch {
-        // if we cannot create the configured log dir, fall back to the default
         dir = path.join(os.tmpdir(), "opencode", "server-logs");
         try {
             fs.mkdirSync(dir, { recursive: true });
         }
         catch {
-            // give up on a custom dir; the Start-Process redirect will fail loudly
+            // give up on a custom dir; the redirect will fail loudly
         }
     }
-    const cwd = typeof workdir === "string" && workdir.trim() !== "" ? workdir : process.cwd();
-    const ts = Date.now();
-    const outLog = path.join(dir, `${baseName(command)}-${ts}.out.log`);
-    const errLog = path.join(dir, `${baseName(command)}-${ts}.err.log`);
-    // stdin must be redirected too: an inherited write-end stdin pipe is what
-    // keeps the original bash tool call open. Start-Process rejects device
-    // paths (e.g. NUL), so give it a real empty file (like </dev/null).
-    const inLog = path.join(dir, `${baseName(command)}-${ts}.in.txt`);
-    fs.writeFileSync(inLog, "");
+    return dir;
+}
+/**
+ * POSIX (mac/linux) rewrite: detach via `nohup sh -c ... </dev/null >log 2>log
+ * &`. The original command travels inside single quotes (escape `'`), so no
+ * shell-quoting hazard and no dependence on base64. Captures the background
+ * job's pid into `pidPath` so the status probe can track it later.
+ */
+export function buildPosixCommand(command, outLog, errLog, cwd, pidPath) {
+    return (`echo '[server-start-guard] detached server start -> ${shq(outLog)}'; ` +
+        `cd '${shq(cwd)}' && nohup sh -c '${shq(command)}' ` +
+        `</dev/null >'${shq(outLog)}' 2>'${shq(errLog)}' & PID=$!; ` +
+        `echo "$PID" > '${shq(pidPath)}'`);
+}
+/**
+ * Windows (pwsh) rewrite: detach via a second pwsh launched with
+ * -EncodedCommand (base64 UTF-16LE, so no shell-quoting hazards), its
+ * stdout/stderr redirected to per-invocation log files. stdin must be
+ * redirected too: an inherited write-end stdin pipe is what keeps the original
+ * bash tool call open. Start-Process rejects device paths (e.g. NUL), so give
+ * it a real empty file (like </dev/null). -PassThru + pid file let the status
+ * probe track the launcher afterwards.
+ */
+export function buildWindowsCommand(command, outLog, errLog, inLog, cwd, pidPath) {
     // Script executes in a fresh pwsh: cd to workdir, then run the original
     // command verbatim. Encoded as UTF-16LE base64 (-EncodedCommand).
     const script = `Set-Location -LiteralPath '${cwd.replace(/'/g, "''")}'\r\n${command}`;
     const encoded = Buffer.from(script, "utf16le").toString("base64");
     return (`Write-Output '[server-start-guard] detached server start -> ${outLog}'; ` +
-        `Start-Process pwsh -ArgumentList '-NoProfile','-EncodedCommand',${encoded} ` +
+        `$p = Start-Process pwsh -ArgumentList '-NoProfile','-EncodedCommand',${encoded} ` +
         `-RedirectStandardInput '${inLog}' ` +
-        `-RedirectStandardOutput '${outLog}' -RedirectStandardError '${errLog}'`);
+        `-RedirectStandardOutput '${outLog}' -RedirectStandardError '${errLog}' ` +
+        `-PassThru; $p.Id | Out-File -Encoding 'ascii' '${pidPath}'`);
+}
+/**
+ * Rewrites a server-start command into a detached, stdio-redirected form so
+ * the original bash tool call returns immediately and never freezes on an
+ * inherited output pipe. Also seeds the status sidecar (state + pid file
+ * paths) so `buildStatusProbe` can later tell the agent when the server
+ * changes.
+ */
+export function rewrite(command, cfg, workdir) {
+    const dir = resolveLogDir(cfg);
+    const cwd = typeof workdir === "string" && workdir.trim() !== ""
+        ? workdir
+        : process.cwd();
+    const ts = Date.now();
+    const stem = baseName(command);
+    const outLog = path.join(dir, `${stem}-${ts}.out.log`);
+    const errLog = path.join(dir, `${stem}-${ts}.err.log`);
+    const pidPath = pidFilePath(dir, stem, ts);
+    writeSidecar(stateFilePath(dir, stem, ts), {
+        command,
+        workdir: cwd,
+        startedAt: new Date().toISOString(),
+        outLog,
+        errLog,
+    });
+    if (IS_WINDOWS) {
+        const inLog = path.join(dir, `${stem}-${ts}.in.txt`);
+        fs.writeFileSync(inLog, "");
+        return buildWindowsCommand(command, outLog, errLog, inLog, cwd, pidPath);
+    }
+    return buildPosixCommand(command, outLog, errLog, cwd, pidPath);
 }
 //# sourceMappingURL=rewrite.js.map
