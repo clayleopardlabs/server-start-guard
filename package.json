@@ -3,7 +3,8 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "build": "tsc"
+    "build": "tsc",
+    "verify": "node verify/leakregress.mjs"
   },
   "dependencies": {
     "@opencode-ai/plugin": "^1.17.5"

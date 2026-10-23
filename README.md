@@ -22,9 +22,9 @@ You are done.
 
 ## What happens when a server starts
 
-The server command is rewritten into a detached form with all of its input and output redirected to log files, so the `bash` call returns immediately:
+The server command is rewritten into a detached form with its output redirected to log files, so the `bash` call returns immediately:
 
-- **Windows:** a second `pwsh` is launched with the original command encoded (`-EncodedCommand`, base64 UTF-16LE), with stdout/stderr/stdin redirected to real files and `-PassThru` used to capture the launcher's pid.
+- **Windows:** the command is handed to a fresh `pwsh` (encoded, base64 UTF-16LE) which is started through `Win32_Process.Create`. That starts the new process with no inherited handles, so nothing in the new process tree can hold the assistant's output pipe open. The new process sends its own output and errors to the log files and records its pid.
 - **macOS / Linux:** the command is single-quote-escaped and run as `nohup sh -c '<command>' </dev/null >out.log 2>err.log &`, with the job's pid captured to a `.pid` file.
 
 Logs land in `%TMP%\opencode\server-logs` (Windows) or `os.tmpdir()/opencode/server-logs` (POSIX), or a custom `logDir` from the config.
@@ -51,12 +51,24 @@ Health probing is last-successful-response based: the guard tracks *when the las
 
 Every probe also covers **both loopback address families** (IPv4 `127.0.0.1` and IPv6 `::1`), so a server that binds only one family is still reachable. A timeout is recorded as a distinct failure kind from a refused connection, but neither one by itself declares a server unhealthy. Only the stale last-successful-response clock does.
 
+## No more stuck agents
+
+Two mechanisms make sure an agent can never wait for hours again:
+
+1. **A hard time limit on every bash command.** The guard always sets the bash tool's own timeout. A command that is rewritten as a server start gets a short bound (default 15 seconds), because a working detached start returns in milliseconds. Every other command gets a ceiling (default 10 minutes). This limit is a backstop, not the fix. A call can outlive its limit when the started program still holds the assistant's pipe. The real fix is that the new process tree holds none of the assistant's pipes.
+2. **A separate watchdog process.** The lazy status probe only runs when the agent runs a bash command. If the agent stops issuing commands, a quiet-but-alive server could hold its port forever with nobody looking. To close that gap, the guard starts one detached helper process (outside the agent entirely, with no connection to any tool pipe). It checks the tracking files every 10 seconds, and force-kills any tracked server whose logs say nothing for 5 minutes. It writes a small note next to the removed tracking files, and the next bash command reports "server KILLED by watchdog". It stops itself when no servers are left to watch.
+
 ## Configuration
 
 Settings live in `~/.config/opencode/plugins/server-start-guard/config.json` and are read again on every command, so edits apply without restarting opencode:
 
 - `enabled` (bool): turn the guard on or off.
 - `logDir` (string): where detached servers write their logs (and the guard its tracking files).
+- `bashTimeoutMs` (number, default `600000`): the hard time limit (ms) for every non-rewritten bash command. A command asked to run longer is cut down to this.
+- `detachTimeoutMs` (number, default `15000`): the time limit (ms) given to a command that was rewritten into a detached server start. It returns in milliseconds anyway; this bound only protects against a broken rewrite.
+- `watchdogEnabled` (bool, default `true`): turn the detached watchdog on or off.
+- `watchdogPollMs` (number, default `10000`): how often the watchdog checks the tracking files.
+- `watchdogStalledAfterMs` (number, default `300000`): how long a server's logs must stay silent before the watchdog force-kills it.
 - `extraPatterns` (string[]): extra substrings; any command containing one is treated as a server start.
 - `healthChecks` (array of `{ "pattern": "...", "url": "..." }`): explicit health-check URLs. The first rule whose pattern appears in the command wins, e.g. to probe your custom port:
   ```json
@@ -75,6 +87,6 @@ Settings live in `~/.config/opencode/plugins/server-start-guard/config.json` and
 2. Remove the line about server start guard from the opencode settings file.
 3. Restart opencode.
 
-## One known issue
+## A note on Windows
 
-On Windows, a helper agent can stay stuck after it starts a server, even though the server itself runs fine. This is a problem in opencode on Windows, not in this add-on. The server keeps working while the helper agent is stuck.
+Older versions started the detached server with `Start-Process` and file redirection. That form still inherits the assistant's output pipe, so the `bash` call could stay open for as long as the server ran. The launcher now uses `Win32_Process.Create`, which starts the process with no inherited handles. Tested with a long running server: the call returns in about 0.3 seconds and the server keeps running.

@@ -15,15 +15,19 @@ export declare function resolveLogDir(cfg: ServerStartGuardConfig): string;
  */
 export declare function buildPosixCommand(command: string, outLog: string, errLog: string, cwd: string, pidPath: string): string;
 /**
- * Windows (pwsh) rewrite: detach via a second pwsh launched with
- * -EncodedCommand (base64 UTF-16LE, so no shell-quoting hazards), its
- * stdout/stderr redirected to per-invocation log files. stdin must be
- * redirected too: an inherited write-end stdin pipe is what keeps the original
- * bash tool call open. Start-Process rejects device paths (e.g. NUL), so give
- * it a real empty file (like </dev/null). -PassThru + pid file let the status
- * probe track the launcher afterwards.
+ * Windows (pwsh) rewrite: detach via `Win32_Process.Create`, whose child is
+ * created with handle inheritance OFF. That is what makes the tool call return
+ * immediately — `Start-Process -RedirectStandard*` inherits the tool's pipe
+ * write-end, which keeps the call open until the server exits.
+ *
+ * Stdio is redirected by the payload itself (`& { <cmd> } 1> out 2> err`), and
+ * the child is created with no inherited stdin, so nothing can hold the tool's
+ * pipes open. The original command is preserved verbatim inside the encoded
+ * script (base64 UTF-16LE), so PowerShell semantics and quoting are untouched.
+ * -EncodedCommand needs no shell quoting, and the pid of the launched pwsh is
+ * recorded so the probe and the watchdog can track and kill the whole tree.
  */
-export declare function buildWindowsCommand(command: string, outLog: string, errLog: string, inLog: string, cwd: string, pidPath: string): string;
+export declare function buildWindowsCommand(command: string, outLog: string, errLog: string, cwd: string, pidPath: string): string;
 /**
  * Rewrites a server-start command into a detached, stdio-redirected form so
  * the original bash tool call returns immediately and never freezes on an

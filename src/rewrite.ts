@@ -20,9 +20,16 @@ import { pidFilePath, stateFilePath, writeSidecar } from "./status.js";
 
 /**
  * The detachment primitive is platform-specific:
- *   - Windows (pwsh):  Start-Process pwsh -EncodedCommand ... with
- *     -RedirectStandardInput/-Output/-Error. base64 UTF-16LE avoids
- *     shell-quoting hazards.
+ *   - Windows (pwsh): `Invoke-CimMethod -ClassName Win32_Process -MethodName
+ *     Create` with an -EncodedCommand pwsh payload (base64 UTF-16LE, so no
+ *     shell-quoting hazards). Win32_Process.Create runs the child with handle
+ *     inheritance OFF, which is the whole point: `Start-Process
+ *     -RedirectStandard*` opens the child with inheritance ON, so the child
+ *     receives the bash tool's stdout pipe write-end as an extra handle and
+ *     keeps the tool call open for as long as the server lives. Redirecting
+ *     the std handles does not remove that extra handle. The payload redirects
+ *     its own streams from inside (`& { <cmd> } 1> out 2> err`), so logs are
+ *     still captured without any inherited pipe.
  *   - POSIX (mac/linux, bash/sh): single-quote-escape the original command
  *     and run it under `nohup sh -c '...' </dev/null >log 2>log &`. nohup
  *     ignores SIGHUP; /dev/null (not a device-path problem here) closes stdin;
@@ -38,21 +45,19 @@ function shq(s: string): string {
 
 /**
  * Commands that may already be a safe, non-hanging server start:
- *   - Windows: Start-Process must redirect the whole stdout/stderr/stdin
- *     triad — an inherited stdin pipe (the write-end) is what keeps the
- *     original bash call open, so out+err-only still hangs.
+ *   - Windows: ONLY this plugin's own launcher (Win32_Process.Create). A
+ *     hand-written `Start-Process ... -RedirectStandard*` is NOT safe: handle
+ *     inheritance leaks the tool's stdout pipe write-end into the detached
+ *     tree, so the bash call stays open while the server lives (measured: a
+ *     4s child held a piped caller for 4.6s; the same child launched via
+ *     Win32_Process.Create returned in 0.2s).
  *   - POSIX: a nohup background job that already redirects a stream and ends
  *     with `&` is considered detached. A bare `nohup server` (no redirect, no
  *     `&`) is NOT — it still inherits the tool's pipes.
  */
 function isAlreadySafe(command: string): boolean {
   if (IS_WINDOWS) {
-    return (
-      /\bStart-Process\b/i.test(command) &&
-      /-RedirectStandardInput\b/i.test(command) &&
-      /-RedirectStandardOutput\b/i.test(command) &&
-      /-RedirectStandardError\b/i.test(command)
-    );
+    return /Win32_Process/i.test(command) && /-MethodName\s+Create\b/i.test(command);
   }
   return (
     /\bnohup\b/i.test(command) &&
@@ -153,33 +158,46 @@ export function buildPosixCommand(
 }
 
 /**
- * Windows (pwsh) rewrite: detach via a second pwsh launched with
- * -EncodedCommand (base64 UTF-16LE, so no shell-quoting hazards), its
- * stdout/stderr redirected to per-invocation log files. stdin must be
- * redirected too: an inherited write-end stdin pipe is what keeps the original
- * bash tool call open. Start-Process rejects device paths (e.g. NUL), so give
- * it a real empty file (like </dev/null). -PassThru + pid file let the status
- * probe track the launcher afterwards.
+ * Windows (pwsh) rewrite: detach via `Win32_Process.Create`, whose child is
+ * created with handle inheritance OFF. That is what makes the tool call return
+ * immediately — `Start-Process -RedirectStandard*` inherits the tool's pipe
+ * write-end, which keeps the call open until the server exits.
+ *
+ * Stdio is redirected by the payload itself (`& { <cmd> } 1> out 2> err`), and
+ * the child is created with no inherited stdin, so nothing can hold the tool's
+ * pipes open. The original command is preserved verbatim inside the encoded
+ * script (base64 UTF-16LE), so PowerShell semantics and quoting are untouched.
+ * -EncodedCommand needs no shell quoting, and the pid of the launched pwsh is
+ * recorded so the probe and the watchdog can track and kill the whole tree.
  */
 export function buildWindowsCommand(
   command: string,
   outLog: string,
   errLog: string,
-  inLog: string,
   cwd: string,
   pidPath: string,
 ): string {
-  // Script executes in a fresh pwsh: cd to workdir, then run the original
-  // command verbatim. Encoded as UTF-16LE base64 (-EncodedCommand).
-  const script = `Set-Location -LiteralPath '${cwd.replace(/'/g, "''")}'\r\n${command}`;
+  // Single quotes survive PowerShell parsing; double them for literal use.
+  const q = (s: string): string => s.replace(/'/g, "''");
+
+  // Multi-line block so a trailing comment in the original command cannot
+  // swallow the closing brace. Redirection lives inside the payload.
+  const script = [
+    "$ErrorActionPreference = 'Continue'",
+    `Set-Location -LiteralPath '${q(cwd)}'`,
+    "& {",
+    command,
+    `} 1> '${q(outLog)}' 2> '${q(errLog)}'`,
+  ].join("\r\n");
   const encoded = Buffer.from(script, "utf16le").toString("base64");
 
   return (
-    `Write-Output '[server-start-guard] detached server start -> ${outLog}'; ` +
-    `$p = Start-Process pwsh -ArgumentList '-NoProfile','-EncodedCommand',${encoded} ` +
-    `-RedirectStandardInput '${inLog}' ` +
-    `-RedirectStandardOutput '${outLog}' -RedirectStandardError '${errLog}' ` +
-    `-PassThru; $p.Id | Out-File -Encoding 'ascii' '${pidPath}'`
+    `Write-Output '[server-start-guard] detached server start -> ${q(outLog)}'; ` +
+    `$ssg = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ ` +
+    `CommandLine = 'pwsh -NoProfile -EncodedCommand ${encoded}'; ` +
+    `CurrentDirectory = '${q(cwd)}' }; ` +
+    `if ($ssg.ReturnValue -ne 0) { throw "server-start-guard: Win32_Process.Create failed ($($ssg.ReturnValue))" }; ` +
+    `$ssg.ProcessId | Out-File -Encoding 'ascii' '${q(pidPath)}'`
   );
 }
 
@@ -219,9 +237,7 @@ export function rewrite(
   });
 
   if (IS_WINDOWS) {
-    const inLog = path.join(dir, `${stem}-${ts}.in.txt`);
-    fs.writeFileSync(inLog, "");
-    return buildWindowsCommand(command, outLog, errLog, inLog, cwd, pidPath);
+    return buildWindowsCommand(command, outLog, errLog, cwd, pidPath);
   }
   return buildPosixCommand(command, outLog, errLog, cwd, pidPath);
 }

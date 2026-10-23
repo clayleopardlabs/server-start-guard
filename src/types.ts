@@ -37,6 +37,33 @@ export interface ServerStartGuardConfig {
   enabled: boolean;
   /** Directory where detached server stdout/stderr logs are written. */
   logDir: string;
+  /**
+   * Hard ceiling (ms) for the `timeout` argument of every `bash` tool call the
+   * hook touches. The hook always forces `output.args.timeout = min(existing,
+   * bashTimeoutMs)`, so no agent session can hang on a server-start or any other
+   * command for longer than this. Prevents the "stuck for hours" failure even
+   * when a process wrongly inherits the tool's output pipe.
+   */
+  bashTimeoutMs: number;
+  /**
+   * Timeout (ms) forced on a command the hook actually rewrites into a detached
+   * form. The rewritten call must return almost instantly (it just launches a
+   * detached process), so a short bound is insurance against a broken rewrite,
+   * not a constraint on the server itself.
+   */
+  detachTimeoutMs: number;
+  /** Enable the detached watchdog process that force-kills wedged servers. */
+  watchdogEnabled: boolean;
+  /** Watchdog poll interval (ms) while servers are tracked. */
+  watchdogPollMs: number;
+  /**
+   * Kill a tracked server whose logs have been silent for this long (ms). The
+   * watchdog is external to the agent: a separate detached node process scans
+   * the state dir and force-kills such processes, writing a kill-note that the
+   * next probe announces. Guards against orphaned/wedged servers holding ports
+   * indefinitely.
+   */
+  watchdogStalledAfterMs: number;
   /** Optional extra regex substrings of additional commands to treat as servers. */
   extraPatterns: string[];
   /**

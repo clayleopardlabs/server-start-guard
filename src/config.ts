@@ -5,6 +5,11 @@ function defaults(): ServerStartGuardConfig {
   return {
     enabled: true,
     logDir: DEFAULT_LOG_DIR,
+    bashTimeoutMs: 10 * 60 * 1000,
+    detachTimeoutMs: 15 * 1000,
+    watchdogEnabled: true,
+    watchdogPollMs: 10 * 1000,
+    watchdogStalledAfterMs: 5 * 60 * 1000,
     extraPatterns: [],
     healthChecks: [],
     defaultHealthChecks: true,
@@ -26,6 +31,11 @@ export function readConfig(): ServerStartGuardConfig {
       const raw = JSON.parse(readFileSync(CONFIG_PATH, "utf-8")) as Partial<ServerStartGuardConfig>;
       if (typeof raw.enabled === "boolean") cfg.enabled = raw.enabled;
       if (typeof raw.logDir === "string" && raw.logDir.trim() !== "") cfg.logDir = raw.logDir;
+      if (typeof raw.bashTimeoutMs === "number" && raw.bashTimeoutMs > 0) cfg.bashTimeoutMs = raw.bashTimeoutMs;
+      if (typeof raw.detachTimeoutMs === "number" && raw.detachTimeoutMs > 0) cfg.detachTimeoutMs = raw.detachTimeoutMs;
+      if (typeof raw.watchdogEnabled === "boolean") cfg.watchdogEnabled = raw.watchdogEnabled;
+      if (typeof raw.watchdogPollMs === "number" && raw.watchdogPollMs > 0) cfg.watchdogPollMs = raw.watchdogPollMs;
+      if (typeof raw.watchdogStalledAfterMs === "number" && raw.watchdogStalledAfterMs > 0) cfg.watchdogStalledAfterMs = raw.watchdogStalledAfterMs;
       if (Array.isArray(raw.extraPatterns)) {
         cfg.extraPatterns = raw.extraPatterns.filter((p) => typeof p === "string");
       }

@@ -1,16 +1,18 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { discoverBoundUrl, probeHttpAny, type HttpProbeKind } from "./health.js";
+import { readKillNote } from "./killnote.js";
+import { isAlive } from "./pid.js";
 import type { ServerStartGuardConfig } from "./types.js";
 
 /**
- * Status probes — the lazy, cross-platform observability half of the guard.
+ * Status probes - the lazy, cross-platform observability half of the guard.
  *
  * On detach the rewrite writes a `.state.json` sidecar (schema below) next to
  * the logs, and the launched wrapper records the daemon pid in a sibling
  * `<stem>-<ts>.pid` file. On EVERY subsequent bash call the hook runs
  * `probeServers` (in-process, no child processes) against the state dir and
- * prepends a plain `echo`/`Write-Output` with any ANNOUNCEMENTS — before still
+ * prepends a plain `echo`/`Write-Output` with any ANNOUNCEMENTS - before still
  * doing the pid existence check. The probe also actively checks HTTP health
  * when a probe URL can be resolved for the server.
  *
@@ -19,7 +21,7 @@ import type { ServerStartGuardConfig } from "./types.js";
  * more powerful and far less fragile:
  *   - it can perform real HTTP requests (the only way to catch a process that
  *     is alive but serving 500s / answering nothing);
- *   - it has no shell-quoting surface at all — the emitted command is nothing
+ *   - it has no shell-quoting surface at all - the emitted command is nothing
  *     but literal `echo`/`Write-Output` lines (plus the original command);
  *   - it is identical across Windows and POSIX (no Get-Process vs kill -0
  *     divergence, no `find -mmin` vs LastWriteTime divergence).
@@ -27,18 +29,19 @@ import type { ServerStartGuardConfig } from "./types.js";
  * Fire-and-forget is preserved: no long-lived process is spawned. The agent's
  * own next bash command is the notification channel, so the probe is lazy
  * (runs then, not pushed). Only TRANSITIONS are announced:
- *   - DIED      — pid gone     (reported once, then state removed)
- *   - STALLED   — alive but no log write for STALLED_MS (answered once; a
+ *   - DIED      - pid gone     (reported once, then state removed)
+ *   - STALLED   - alive but no log write for STALLED_MS (answered once; a
  *                 later log write flips this back and announces RECOVERED)
- *   - UNHEALTHY — pid alive and past the boot grace, but for STALLED_MS there
+ *   - UNHEALTHY - pid alive and past the boot grace, but for STALLED_MS there
  *                 has been NO last successful HTTP response (a real <500 from
  *                 the address families the server actually bound). A single
- *                 probe failure — timeout OR refused — is NOT a diagnosis on
+ *                 probe failure - timeout OR refused - is NOT a diagnosis on
  *                 its own (recompiles and slow boots pause a server well
  *                 inside the window); only a stale last-good response
  *                 escalates. Announced once per episode; the next real <500
  *                 response announces RECOVERED.
- *   - RECOVERED — server that was STALLED or UNHEALTHY is healthy again
+ *   - RECOVERED - server that was STALLED or UNHEALTHY is healthy again
+ *   - KILLED    - the detached watchdog force-killed a log-silent server
  * Healthy servers are silent.
  *
  * Last-successful-response semantics are the whole point of the health half:
@@ -113,10 +116,12 @@ export function hasTrackedServers(dir: string): boolean {
 }
 
 export interface ProbeAnnouncement {
-  severity: "died" | "stalled" | "unhealthy" | "recovered";
+  severity: "died" | "stalled" | "unhealthy" | "recovered" | "killed";
   pid: number;
   display: string;
   url?: string;
+  /** silence observed by the watchdog that triggered the kill, in ms */
+  stalledMs?: number;
 }
 
 function readSidecar(statePath: string): ServerSidecar | undefined {
@@ -137,21 +142,8 @@ function readPid(pidPath: string): number {
   }
 }
 
-/**
- * Cross-platform pid existence check entirely in-process. ESRCH = gone;
- * EPERM (exists but not ours) counts as alive.
- */
-function isAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (err) {
-    return (err as NodeJS.ErrnoException).code === "EPERM";
-  }
-}
-
 /** Newest LastWriteTime among the server's existing log files, or 0. */
-function newestLogWrite(sidecar: ServerSidecar): number {
+export function newestLogWrite(sidecar: ServerSidecar): number {
   let newest = 0;
   for (const log of [sidecar.outLog, sidecar.errLog]) {
     try {
@@ -166,7 +158,7 @@ function newestLogWrite(sidecar: ServerSidecar): number {
 
 /**
  * Effective URL to probe for a server: prefer the host:port the process
- * printed in its own logs (authoritative — a dev server that found its
+ * printed in its own logs (authoritative - a dev server that found its
  * requested port taken and moved is serving somewhere the rewrite guess
  * cannot know), else the rewrite-time guess, else nothing.
  */
@@ -205,14 +197,16 @@ async function probeOne(
     out.push({ severity: "recovered", pid, display });
   }
 
-  // 2. Active HTTP health — last-successful-response semantics. Only when a
+  // 2. Active HTTP health - last-successful-response semantics. Only when a
   // probe URL is resolvable, past the boot grace period, throttled to one
   // probe per healthIntervalMs.
   const probeUrl = effectiveProbeUrl(sidecar);
   if (probeUrl) {
     const startedMs = Date.parse(sidecar.startedAt) || now;
     const ageOk = now - startedMs >= cfg.healthGraceMs;
-    const throttle = sidecar.lastProbeAt === undefined || now - sidecar.lastProbeAt >= cfg.healthIntervalMs;
+    const throttle =
+      sidecar.lastProbeAt === undefined ||
+      now - sidecar.lastProbeAt >= cfg.healthIntervalMs;
     if (ageOk && throttle) {
       const result = await probeHttpAny(probeUrl, cfg.healthTimeoutMs);
       sidecar.lastProbeAt = now;
@@ -229,7 +223,7 @@ async function probeOne(
         }
       } else {
         sidecar.lastFail = result.kind;
-        // Escalate ONLY by staleness of the last-successful-response clock —
+        // Escalate ONLY by staleness of the last-successful-response clock -
         // never on a single probe. A slow recompile or a late boot ages the
         // clock; it does not turn one timeout into a diagnosis. For a server
         // that has never answered, the clock is pinned to the START of its
@@ -262,14 +256,57 @@ export function renderAnnouncement(a: ProbeAnnouncement): string {
     case "died":
       return `[server-start-guard] server DIED (pid ${a.pid}): ${a.display}`;
     case "stalled":
-      return `[server-start-guard] server STALLED (pid ${a.pid}, no log writes in ${Math.round(STALLED_MS / 60000)}m): ${a.display}`;
+      return `[server-start-guard] server STALLED (pid ${a.pid}, no log writes in ${Math.round(
+        STALLED_MS / 60000,
+      )}m): ${a.display}`;
     case "unhealthy":
-      return `[server-start-guard] server UNHEALTHY (pid ${a.pid}, no good response in ${Math.round(STALLED_MS / 60000)}m): ${a.display} @ ${a.url}`;
+      return `[server-start-guard] server UNHEALTHY (pid ${a.pid}, no good response in ${Math.round(
+        STALLED_MS / 60000,
+      )}m): ${a.display} @ ${a.url}`;
     case "recovered":
       return a.url
         ? `[server-start-guard] server RECOVERED (pid ${a.pid}): ${a.display} @ ${a.url}`
         : `[server-start-guard] server RECOVERED (pid ${a.pid}): ${a.display}`;
+    case "killed":
+      return `[server-start-guard] server KILLED by watchdog (pid ${a.pid}, log silence > ${Math.round(
+        (a.stalledMs ?? STALLED_MS) / 60000,
+      )}m): ${a.display}`;
   }
+}
+
+/**
+ * Scan the state dir for watchdog kill-notes and return them as announcements.
+ * Kill-notes are written by the detached watchdog runner beside a state file it
+ * force-killed. Each is reported exactly once: the note is deleted here.
+ */
+export function readKillNotes(dir: string): ProbeAnnouncement[] {
+  let files: string[];
+  try {
+    files = fs.readdirSync(dir);
+  } catch {
+    return [];
+  }
+
+  const out: ProbeAnnouncement[] = [];
+  for (const f of files) {
+    if (!f.toLowerCase().endsWith(".kill.note.json")) continue;
+    const notePath = path.join(dir, f);
+    const note = readKillNote(notePath);
+    // The note may still be mid-write (partial JSON) - skip and retry next call.
+    if (!note) continue;
+    out.push({
+      severity: "killed",
+      pid: note.pid,
+      display: note.display,
+      stalledMs: note.stalledMs,
+    });
+    try {
+      fs.unlinkSync(notePath);
+    } catch {
+      // already gone - fine
+    }
+  }
+  return out;
 }
 
 /**
@@ -315,7 +352,7 @@ export async function probeServers(
           fs.unlinkSync(statePath);
           fs.unlinkSync(pidPath);
         } catch {
-          // already gone — fine
+          // already gone - fine
         }
       }
     }
@@ -325,7 +362,7 @@ export async function probeServers(
 
 /**
  * Prepend the notifications to the real command. Produces ONLY literal
- * echo/Write-Output lines — there is no shell logic embedded, so nothing to
+ * echo/Write-Output lines - there is no shell logic embedded, so nothing to
  * quote-bug. Returns `cmd` unchanged when there is nothing to say.
  */
 export function buildProbeEcho(
@@ -334,7 +371,10 @@ export function buildProbeEcho(
   isWindows: boolean,
 ): string {
   if (announcements.length === 0) return cmd;
-  const quotes = (s: string): string => (isWindows ? `'${s.replace(/'/g, "''")}'` : `'${s.replace(/'/g, `'\\''`)}'`);
-  const lines = announcements.map((a) => (`${isWindows ? "Write-Output" : "echo"} ${quotes(renderAnnouncement(a))}`));
+  const quotes = (s: string): string =>
+    isWindows ? `'${s.replace(/'/g, "''")}'` : `'${s.replace(/'/g, `'\\''`)}'`;
+  const lines = announcements.map(
+    (a) => `${isWindows ? "Write-Output" : "echo"} ${quotes(renderAnnouncement(a))}`,
+  );
   return `${lines.join("; ")}; ${cmd}`;
 }
