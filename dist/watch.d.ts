@@ -27,12 +27,4 @@ export declare function killTree(pid: number): void;
  * idle process behind after every server that has died.
  */
 export declare function hasLiveTrackedServers(dir: string, orphanMs?: number): boolean;
-/**
- * One scan of the state dir.
- *
- * A tracked server is killed only when it has been log-silent for
- * `stalledAfterMs` AND it is not answering HTTP. Log silence alone is not
- * evidence of a wedge: a healthy dev server with no traffic writes nothing,
- * so killing on silence alone would reap working servers.
- */
 export declare function scanOnce(opts: WatchOptions): Promise<void>;

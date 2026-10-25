@@ -91,6 +91,13 @@ export function resolveRunnerRuntime() {
 /** In-process fallback runners, keyed by log dir. */
 const inProcess = new Map();
 /**
+ * Log dirs where a spawned runner was seen to die immediately. The in-process
+ * watch takes over for those, so the feature degrades instead of vanishing: a
+ * detached child that exits at once (bad argv, unloadable module, missing
+ * runtime) otherwise leaves no trace at all - its stdio is ignored.
+ */
+const runnerDead = new Set();
+/**
  * Last-resort watch that needs no child process: a single unref'd interval in
  * the plugin's own process. Only used when no runtime can be spawned, and it
  * stops itself once nothing is tracked.
@@ -138,6 +145,10 @@ export function ensureWatchdog(dir, cfg) {
     // in a fresh session would try to start a runner.
     if (!hasLiveTrackedServers(dir))
         return undefined;
+    if (runnerDead.has(dir)) {
+        ensureInProcessWatch(dir, cfg);
+        return undefined;
+    }
     if (watchdogRunning(dir))
         return undefined;
     const runner = runnerScriptPath();
@@ -148,16 +159,23 @@ export function ensureWatchdog(dir, cfg) {
         ensureInProcessWatch(dir, cfg);
         return undefined;
     }
-    const options = JSON.stringify({
-        dir,
-        pollMs: cfg.watchdogPollMs,
-        stalledAfterMs: cfg.watchdogStalledAfterMs,
-        healthTimeoutMs: cfg.healthTimeoutMs,
-        lockPath: lockPath(dir),
-    });
+    // Options travel through a file, not argv: a JSON argument is fragile through
+    // some spawn implementations on Windows, and a mangled one makes the runner
+    // exit instantly with its stdio ignored, i.e. invisibly.
+    try {
+        fs.writeFileSync(path.join(dir, ".watchdog.json"), JSON.stringify({
+            pollMs: cfg.watchdogPollMs,
+            stalledAfterMs: cfg.watchdogStalledAfterMs,
+            healthTimeoutMs: cfg.healthTimeoutMs,
+            lockPath: lockPath(dir),
+        }), "utf-8");
+    }
+    catch {
+        // the runner falls back to defaults
+    }
     let child;
     try {
-        child = spawn(runtime, [runner, options], {
+        child = spawn(runtime, [runner, dir], {
             detached: true,
             stdio: "ignore",
             windowsHide: true,
@@ -174,13 +192,29 @@ export function ensureWatchdog(dir, cfg) {
     });
     child.unref();
     if (typeof child.pid === "number" && child.pid > 0) {
+        const pid = child.pid;
         try {
-            fs.writeFileSync(lockPath(dir), String(child.pid), "utf-8");
+            fs.writeFileSync(lockPath(dir), String(pid), "utf-8");
         }
         catch {
             // lock write failure: the runner still works, the next call may spawn a
             // duplicate that exits on its own lock check - acceptable
         }
+        // A spawn can succeed and the child still die in its first milliseconds.
+        // Verify once, off the hook's critical path, and hand over to the
+        // in-process watch if it did not survive.
+        setTimeout(() => {
+            if (isAlive(pid))
+                return;
+            runnerDead.add(dir);
+            try {
+                fs.unlinkSync(lockPath(dir));
+            }
+            catch {
+                // already gone
+            }
+            ensureInProcessWatch(dir, cfg);
+        }, 500).unref?.();
     }
     else {
         ensureInProcessWatch(dir, cfg);

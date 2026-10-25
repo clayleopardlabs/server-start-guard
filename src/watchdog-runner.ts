@@ -1,4 +1,5 @@
 import * as fs from "node:fs";
+import * as path from "node:path";
 import { isAlive } from "./pid.js";
 import { hasLiveTrackedServers, scanOnce } from "./watch.js";
 
@@ -22,26 +23,49 @@ interface RunnerOptions {
 }
 
 function readOptions(): RunnerOptions | undefined {
-  try {
-    const o = JSON.parse(process.argv[2] ?? "{}") as Partial<RunnerOptions>;
-    if (typeof o.dir !== "string" || o.dir === "") return undefined;
-    if (typeof o.lockPath !== "string" || o.lockPath === "") return undefined;
-    return {
-      dir: o.dir,
-      pollMs: typeof o.pollMs === "number" && o.pollMs > 0 ? o.pollMs : 10_000,
-      stalledAfterMs:
-        typeof o.stalledAfterMs === "number" && o.stalledAfterMs > 0
-          ? o.stalledAfterMs
-          : 5 * 60 * 1000,
-      healthTimeoutMs:
-        typeof o.healthTimeoutMs === "number" && o.healthTimeoutMs > 0
-          ? o.healthTimeoutMs
-          : 2000,
-      lockPath: o.lockPath,
-    };
-  } catch {
-    return undefined;
+  const arg = process.argv[2] ?? "";
+  // Two accepted forms: the directory (preferred) or a JSON blob (legacy).
+  // The path form exists because a JSON argument is fragile through some spawn
+  // implementations on Windows: quotes and backslashes get mangled, the runner
+  // exits before it can log anything, and the watchdog silently does not exist.
+  // Options then come from `<dir>/.watchdog.json`, written by the spawner.
+  let raw: Partial<RunnerOptions> = {};
+  let dir = "";
+  if (arg.trimStart().startsWith("{")) {
+    try {
+      raw = JSON.parse(arg) as Partial<RunnerOptions>;
+    } catch {
+      return undefined;
+    }
+    dir = typeof raw.dir === "string" ? raw.dir : "";
+  } else {
+    dir = arg.trim();
   }
+  if (!dir) return undefined;
+  try {
+    const fromFile = JSON.parse(
+      fs.readFileSync(path.join(dir, ".watchdog.json"), "utf-8"),
+    ) as Partial<RunnerOptions>;
+    raw = { ...fromFile, ...raw };
+  } catch {
+    // no options file: defaults below
+  }
+  return {
+    dir,
+    pollMs: typeof raw.pollMs === "number" && raw.pollMs > 0 ? raw.pollMs : 10_000,
+    stalledAfterMs:
+      typeof raw.stalledAfterMs === "number" && raw.stalledAfterMs > 0
+        ? raw.stalledAfterMs
+        : 5 * 60 * 1000,
+    healthTimeoutMs:
+      typeof raw.healthTimeoutMs === "number" && raw.healthTimeoutMs > 0
+        ? raw.healthTimeoutMs
+        : 2000,
+    lockPath:
+      typeof raw.lockPath === "string" && raw.lockPath
+        ? raw.lockPath
+        : path.join(dir, ".watchdog.pid"),
+  };
 }
 
 function releaseLock(opts: RunnerOptions): void {

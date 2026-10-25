@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { execFileSync } from "node:child_process";
-import { isAlive } from "./pid.js";
+import { isAlive, isAliveStrict } from "./pid.js";
 import { discoverBoundUrl, probeHttpAny } from "./health.js";
 import { writeKillNote } from "./killnote.js";
 /**
@@ -113,6 +113,11 @@ export function hasLiveTrackedServers(dir, orphanMs = DEFAULT_ORPHAN_MS) {
  * evidence of a wedge: a healthy dev server with no traffic writes nothing,
  * so killing on silence alone would reap working servers.
  */
+const DBG = process.env.SSG_DEBUG === "1";
+const dbg = (...a) => {
+    if (DBG)
+        console.error("[ssg-watch]", ...a);
+};
 export async function scanOnce(opts) {
     let files;
     try {
@@ -191,6 +196,7 @@ export async function scanOnce(opts) {
             // No log ever written - still booting; do not kill yet.
             continue;
         }
+        dbg("tracked", base, "pid", pid, "silentMs", now - newest);
         if (now - newest < opts.stalledAfterMs)
             continue;
         // Log-silent. Ask the server before killing it: a quiet but answering
@@ -208,20 +214,31 @@ export async function scanOnce(opts) {
             if (!discovered && healthSource === "preset" && !everAnswered)
                 continue;
         }
+        dbg("killing", pid, "url", url, "source", healthSource, "everAnswered", everAnswered);
         killTree(pid);
-        // POSIX without setsid may only reach the wrapper; never claim a kill we
-        // cannot verify, and keep the sidecar so the next scan retries.
-        await new Promise((r) => setTimeout(r, 250));
-        if (isAlive(pid))
-            continue;
-        // The wrapper is gone, but without setsid (macOS) the real server can be a
-        // grandchild that survived. If the URL still answers, the service is alive:
-        // keep the sidecar and skip the note instead of claiming a kill.
-        if (url) {
+        // taskkill returns before Windows has finished tearing the process down, and
+        // a terminated process whose handle is still open elsewhere keeps answering
+        // process.kill(pid, 0). A single 250 ms check therefore reports "still
+        // alive", the sidecar is kept, and the kill later looks like a DIED with the
+        // KILLED note lost. Poll with the accurate check instead.
+        let gone = false;
+        for (let i = 0; i < 10; i++) {
+            await new Promise((r) => setTimeout(r, 200));
+            if (!isAliveStrict(pid)) {
+                gone = true;
+                break;
+            }
+        }
+        if (!gone) {
+            // The pid still answers. If the service behind it does not, the kill did
+            // stop the service; otherwise keep the sidecar and retry next poll.
+            if (!url)
+                continue;
             const after = await probeHttpAny(url, opts.healthTimeoutMs ?? 2000);
             if (after.kind === "ok" || after.kind === "broken")
                 continue;
         }
+        dbg("kill verified, pid gone:", gone);
         try {
             fs.unlinkSync(statePath);
         }
