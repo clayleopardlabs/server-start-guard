@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import * as fs from "node:fs";
 /**
  * Well-known default ports for common dev servers, keyed loosely off the
  * command text. Deliberately inherited from the detection patterns; a
@@ -20,14 +20,15 @@ const PRESET_PORTS = [
  */
 export function resolveHealthUrl(command, cfg) {
     for (const rule of cfg.healthChecks) {
-        if (rule.pattern && command.includes(rule.pattern))
-            return rule.url;
+        if (rule.pattern && command.includes(rule.pattern)) {
+            return { url: rule.url, source: "config" };
+        }
     }
     if (!cfg.defaultHealthChecks)
         return undefined;
     for (const preset of PRESET_PORTS) {
         if (preset.pattern.test(command))
-            return preset.url;
+            return { url: preset.url, source: "preset" };
     }
     return undefined;
 }
@@ -38,22 +39,57 @@ export function resolveHealthUrl(command, cfg) {
  * process that prints a public address is serving it from somewhere we
  * may not be able to reach, so guessing worse is not helpful.
  */
+/** Only the tail of a log is scanned; dev-server URLs appear at boot. */
+const LOG_TAIL_BYTES = 64 * 1024;
+/**
+ * Read at most the last LOG_TAIL_BYTES of a file. Logs are never truncated by
+ * this plugin, so reading them whole would cost a synchronous read of the
+ * entire history on every bash call (and grow without bound).
+ */
+function readTail(file) {
+    try {
+        const st = fs.statSync(file);
+        const start = Math.max(0, st.size - LOG_TAIL_BYTES);
+        const len = st.size - start;
+        if (len <= 0)
+            return "";
+        const fd = fs.openSync(file, "r");
+        try {
+            const buf = Buffer.alloc(len);
+            fs.readSync(fd, buf, 0, len, start);
+            return buf.toString("utf-8");
+        }
+        finally {
+            fs.closeSync(fd);
+        }
+    }
+    catch {
+        return undefined;
+    }
+}
+/**
+ * Parse the host:port a dev server actually bound to from its own log
+ * output. Last match wins because many servers first print "port in use,
+ * trying N+1" before the real line. Only loopback URLs are accepted — a
+ * process that prints a public address is serving it from somewhere we
+ * may not be able to reach, so guessing worse is not helpful.
+ *
+ * Only the origin is captured (scheme + loopback host + port): anything after
+ * it in the log line is a path, and probing a path would test the route
+ * instead of the server.
+ */
 export function discoverBoundUrl(outLog, errLog) {
     let found;
-    const re = /https?:\/\/(?:\[?::1\]?|localhost|127\.0\.0\.1|0\.0\.0\.0)[^\s"'<>]*:\d+/gi;
+    const re = /(?:https?:\/\/)?(\[::1\]|localhost|127\.0\.0\.1|0\.0\.0\.0):(\d{1,5})/gi;
     for (const log of [outLog, errLog]) {
         if (!log)
             continue;
-        let text;
-        try {
-            text = readFileSync(log, "utf-8");
-        }
-        catch {
+        const text = readTail(log);
+        if (text === undefined)
             continue;
-        }
         for (const m of text.matchAll(re)) {
-            if (m[0])
-                found = m[0];
+            if (m[1] && m[2])
+                found = `http://${m[1]}:${m[2]}`;
         }
     }
     return found;
@@ -107,6 +143,10 @@ export async function probeHttp(url, timeoutMs) {
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
         const res = await fetch(url, { signal: controller.signal, redirect: "follow" });
+        // Consume nothing, but release the socket: probes run every few seconds
+        // for the life of a server, and an un-cancelled body keeps the connection
+        // pinned until the pool times it out.
+        void res.body?.cancel().catch(() => { });
         if (res.status >= 500) {
             return { kind: "broken", status: res.status, detail: `HTTP ${res.status}` };
         }

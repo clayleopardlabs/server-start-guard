@@ -3,6 +3,7 @@ import * as path from "node:path";
 import { discoverBoundUrl, probeHttpAny, type HttpProbeKind } from "./health.js";
 import { readKillNote } from "./killnote.js";
 import { isAlive } from "./pid.js";
+import { DEFAULT_ORPHAN_MS } from "./watch.js";
 import type { ServerStartGuardConfig } from "./types.js";
 
 /**
@@ -54,6 +55,9 @@ import type { ServerStartGuardConfig } from "./types.js";
 /** Only announce "stalled" when NO log write happened for this window. */
 export const STALLED_MS = 2 * 60 * 1000;
 
+/** A sidecar whose pid file never appeared is forgotten after this long. */
+const ORPHAN_MS = DEFAULT_ORPHAN_MS;
+
 export interface ServerSidecar {
   command: string;
   workdir: string;
@@ -61,6 +65,11 @@ export interface ServerSidecar {
   outLog: string;
   errLog: string;
   healthUrl?: string;
+  /**
+   * Where `healthUrl` came from. A `refused` result against a GUESSED preset
+   * port is not evidence of a sick server, only of a wrong guess.
+   */
+  healthSource?: "config" | "preset" | "log";
   /**
    * Effective probe URL. Starts as the rewrite-time guess (`healthUrl`), then
    * is replaced by the address the server printed in its own logs when one is
@@ -157,14 +166,12 @@ export function newestLogWrite(sidecar: ServerSidecar): number {
 }
 
 /**
- * Effective URL to probe for a server: prefer the host:port the process
- * printed in its own logs (authoritative - a dev server that found its
- * requested port taken and moved is serving somewhere the rewrite guess
- * cannot know), else the rewrite-time guess, else nothing.
+ * Effective URL to probe for a server. `probeUrl` is kept in sync with the
+ * authority (the process's own logs) by probeServers before this runs, so a
+ * dev server that moved to another port is probed where it actually is.
  */
 function effectiveProbeUrl(sidecar: ServerSidecar): string | undefined {
-  const discovered = discoverBoundUrl(sidecar.outLog, sidecar.errLog);
-  return discovered ?? sidecar.probeUrl ?? sidecar.healthUrl;
+  return sidecar.probeUrl ?? sidecar.healthUrl;
 }
 
 async function probeOne(
@@ -183,57 +190,68 @@ async function probeOne(
 
   let changed = false;
 
-  // 1. Staleness: alive but silent for STALLED_MS -> STALLED once; recovery = RECOVERED.
-  const newest = newestLogWrite(sidecar);
-  if (newest > 0 && now - newest >= STALLED_MS) {
-    if (!sidecar.reportedStalled) {
-      sidecar.reportedStalled = true;
-      changed = true;
-      out.push({ severity: "stalled", pid, display });
-    }
-  } else if (sidecar.reportedStalled && newest > 0) {
-    sidecar.reportedStalled = false;
-    changed = true;
-    out.push({ severity: "recovered", pid, display });
-  }
-
-  // 2. Active HTTP health - last-successful-response semantics. Only when a
-  // probe URL is resolvable, past the boot grace period, throttled to one
-  // probe per healthIntervalMs.
+  // 1. Active HTTP health FIRST, because its result decides whether log
+  // silence is meaningful. Only when a probe URL is resolvable, past the boot
+  // grace period, throttled to one probe per healthIntervalMs.
   const probeUrl = effectiveProbeUrl(sidecar);
+  let answering = false;
+  // One RECOVERED per call: a server that was both unhealthy and stalled used
+  // to announce recovery twice in the same probe.
+  let recoveredThisCall = false;
   if (probeUrl) {
     const startedMs = Date.parse(sidecar.startedAt) || now;
     const ageOk = now - startedMs >= cfg.healthGraceMs;
-    const throttle =
-      sidecar.lastProbeAt === undefined ||
-      now - sidecar.lastProbeAt >= cfg.healthIntervalMs;
-    if (ageOk && throttle) {
+    const gap =
+      sidecar.lastProbeAt === undefined
+        ? Number.POSITIVE_INFINITY
+        : now - sidecar.lastProbeAt;
+    if (ageOk && gap >= cfg.healthIntervalMs) {
       const result = await probeHttpAny(probeUrl, cfg.healthTimeoutMs);
       sidecar.lastProbeAt = now;
       changed = true;
 
       if (result.kind === "ok") {
+        answering = true;
         // A real <500 response resets both the success clock and any episode.
         const wasUnhealthy = sidecar.reportedUnhealthy === true;
         sidecar.reportedUnhealthy = false;
         sidecar.lastGoodAt = now;
         sidecar.lastFail = undefined;
         if (wasUnhealthy) {
+          recoveredThisCall = true;
           out.push({ severity: "recovered", pid, display, url: probeUrl });
         }
       } else {
         sidecar.lastFail = result.kind;
+        const hadGood = sidecar.lastGoodAt !== undefined;
+        // A failure right after a long idle gap is the FIRST observation of
+        // this episode, not the end of one: restart the success clock so the
+        // server must stay unresponsive for STALLED_MS of OBSERVED time before
+        // it is called UNHEALTHY. Without this, one refused probe after an
+        // idle night instantly declares a server unhealthy.
+        if (gap > cfg.healthIntervalMs * 2) sidecar.lastGoodAt = now;
         // Escalate ONLY by staleness of the last-successful-response clock -
         // never on a single probe. A slow recompile or a late boot ages the
         // clock; it does not turn one timeout into a diagnosis. For a server
         // that has never answered, the clock is pinned to the START of its
-        // boot window (grace period), so a never-starting server does still
-        // escalate once that whole window passes unserved.
+        // boot window (grace period).
         const baseline =
           sidecar.lastGoodAt !== undefined
             ? sidecar.lastGoodAt
             : startedMs + cfg.healthGraceMs;
-        if (now - baseline >= STALLED_MS && !sidecar.reportedUnhealthy) {
+        // A refused connection on a GUESSED preset port means the guess was
+        // wrong (the server may listen elsewhere), not that the server is
+        // sick. Only escalate once it has answered that URL at least once, or
+        // when the URL came from config or the server's own logs.
+        const guessMissed =
+          result.kind === "refused" &&
+          sidecar.healthSource === "preset" &&
+          !hadGood;
+        if (
+          !guessMissed &&
+          now - baseline >= STALLED_MS &&
+          !sidecar.reportedUnhealthy
+        ) {
           sidecar.reportedUnhealthy = true;
           out.push({
             severity: "unhealthy",
@@ -243,7 +261,33 @@ async function probeOne(
           });
         }
       }
+    } else if (
+      sidecar.lastGoodAt !== undefined &&
+      now - sidecar.lastGoodAt < STALLED_MS
+    ) {
+      // Throttled this call, but the last real answer is still recent.
+      answering = true;
     }
+  }
+
+  // 2. Log staleness: alive but silent. A server that is still ANSWERING is
+  // not stalled, no matter how quiet its log is - vite logs nothing for an
+  // ordinary page request, so a healthy server with no traffic is silent.
+  const newest = newestLogWrite(sidecar);
+  const fresh = newest > 0 && now - newest < STALLED_MS;
+  if (fresh || answering) {
+    if (sidecar.reportedStalled && !recoveredThisCall) {
+      sidecar.reportedStalled = false;
+      changed = true;
+      out.push({ severity: "recovered", pid, display });
+    } else if (sidecar.reportedStalled) {
+      sidecar.reportedStalled = false;
+      changed = true;
+    }
+  } else if (newest > 0 && !sidecar.reportedStalled) {
+    sidecar.reportedStalled = true;
+    changed = true;
+    out.push({ severity: "stalled", pid, display });
   }
 
   if (changed) writeSidecar(statePath, sidecar);
@@ -333,14 +377,26 @@ export async function probeServers(
 
     const pidPath = statePath.replace(/\.state\.json$/i, "") + ".pid";
     const pid = readPid(pidPath);
-    // Wrapper may not have written the pid file yet on a very fresh detach.
-    if (pid <= 0) continue;
+    // A sidecar with no pid file is a detach whose command never ran (the
+    // permission prompt was denied, the call was aborted). Nothing will ever
+    // write the pid, so it would otherwise be tracked forever and keep a
+    // watchdog runner alive. Give the wrapper a grace window, then forget it.
+    if (pid <= 0) {
+      try {
+        const age = Date.now() - fs.statSync(statePath).mtimeMs;
+        if (age >= ORPHAN_MS) fs.unlinkSync(statePath);
+      } catch {
+        // already gone - fine
+      }
+      continue;
+    }
 
     // Keep the effective probe URL synced with the authority (the process's
     // own logs) so a moved port is probed where the server actually is.
     const discovered = discoverBoundUrl(sidecar.outLog, sidecar.errLog);
     if (discovered && discovered !== sidecar.probeUrl) {
       sidecar.probeUrl = discovered;
+      sidecar.healthSource = "log";
       writeSidecar(statePath, sidecar);
     }
 
@@ -350,6 +406,10 @@ export async function probeServers(
       if (ann.severity === "died") {
         try {
           fs.unlinkSync(statePath);
+        } catch {
+          // already gone - fine
+        }
+        try {
           fs.unlinkSync(pidPath);
         } catch {
           // already gone - fine

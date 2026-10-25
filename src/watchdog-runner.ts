@@ -1,29 +1,46 @@
 import * as fs from "node:fs";
-import * as path from "node:path";
-import { execFileSync } from "node:child_process";
 import { isAlive } from "./pid.js";
-import { writeKillNote } from "./killnote.js";
+import { hasLiveTrackedServers, scanOnce } from "./watch.js";
 
 /**
- * Detached watchdog runner — the ONLY code path scheduled to run outside an
+ * Detached watchdog runner - the only code path scheduled to run outside an
  * agent's tool call. Started by `ensureWatchdog` in watchdog.ts with stdio
  * ignored; reads its options from argv[2] (a JSON string). Never imported by
  * the main plugin (it is spawned, not linked), so nothing it does can pull the
  * agent into a hang.
+ *
+ * The actual scan lives in watch.ts and is shared with the in-process fallback,
+ * so both paths reap servers by exactly the same rule.
  */
 
 interface RunnerOptions {
   dir: string;
   pollMs: number;
   stalledAfterMs: number;
+  healthTimeoutMs?: number;
   lockPath: string;
 }
 
-function readOptions(): RunnerOptions {
+function readOptions(): RunnerOptions | undefined {
   try {
-    return JSON.parse(process.argv[2] ?? "{}") as RunnerOptions;
+    const o = JSON.parse(process.argv[2] ?? "{}") as Partial<RunnerOptions>;
+    if (typeof o.dir !== "string" || o.dir === "") return undefined;
+    if (typeof o.lockPath !== "string" || o.lockPath === "") return undefined;
+    return {
+      dir: o.dir,
+      pollMs: typeof o.pollMs === "number" && o.pollMs > 0 ? o.pollMs : 10_000,
+      stalledAfterMs:
+        typeof o.stalledAfterMs === "number" && o.stalledAfterMs > 0
+          ? o.stalledAfterMs
+          : 5 * 60 * 1000,
+      healthTimeoutMs:
+        typeof o.healthTimeoutMs === "number" && o.healthTimeoutMs > 0
+          ? o.healthTimeoutMs
+          : 2000,
+      lockPath: o.lockPath,
+    };
   } catch {
-    process.exit(1);
+    return undefined;
   }
 }
 
@@ -31,134 +48,47 @@ function releaseLock(opts: RunnerOptions): void {
   try {
     fs.unlinkSync(opts.lockPath);
   } catch {
-    // already gone — fine
+    // already gone - fine
   }
 }
 
-/** Force-kill a process tree. taskkill /T on Windows, SIGKILL elsewhere. */
-function killTree(pid: number): void {
-  if (pid <= 0) return;
-  if (process.platform === "win32") {
-    try {
-      execFileSync("taskkill", ["/PID", String(pid), "/T", "/F"], {
-        stdio: "ignore",
-        windowsHide: true,
-      });
-    } catch {
-      // taskkill exits non-zero when the pid is already gone — acceptable
-    }
-    return;
-  }
-  try {
-    process.kill(pid, "SIGKILL");
-  } catch {
-    // already gone — acceptable
-  }
-}
-
-function newestWriteAcross(sidecar: {
-  outLog: string;
-  errLog: string;
-}): number {
-  let newest = 0;
-  for (const log of [sidecar.outLog, sidecar.errLog]) {
-    try {
-      const t = fs.statSync(log).mtimeMs;
-      if (t > newest) newest = t;
-    } catch {
-      // absent log
-    }
-  }
-  return newest;
-}
-
-function scanOnce(opts: RunnerOptions): void {
-  let files: string[];
-  try {
-    files = fs.readdirSync(opts.dir);
-  } catch {
-    return;
-  }
-
-  const staleThreshold = opts.stalledAfterMs;
-  const now = Date.now();
-
-  for (const f of files) {
-    if (!f.toLowerCase().endsWith(".state.json")) continue;
-    const statePath = path.join(opts.dir, f);
-    const base = statePath.replace(/\.state\.json$/i, "");
-    const pidPath = base + ".pid";
-
-    let pid = 0;
-    try {
-      pid = Number((fs.readFileSync(pidPath, "utf-8").trim().match(/\d+/) || [])[0]) || 0;
-    } catch {
-      // pid file not written yet — a very fresh detach; skip
-      continue;
-    }
-    if (!isAlive(pid)) {
-      // dead already; the lazy probe will clean up on next bash call, and the
-      // runner must not touch it (leaves the DIED announcement to the probe)
-      continue;
-    }
-
-    let command = "";
-    let outLog = "";
-    let errLog = "";
-    try {
-      const sc = JSON.parse(fs.readFileSync(statePath, "utf-8"));
-      command = typeof sc.command === "string" ? sc.command : "";
-      outLog = typeof sc.outLog === "string" ? sc.outLog : "";
-      errLog = typeof sc.errLog === "string" ? sc.errLog : "";
-    } catch {
-      // skip unreadable sidecar
-      continue;
-    }
-
-    const newest = newestWriteAcross({ outLog, errLog });
-    if (newest === 0) {
-      // no log ever written — still booting; do not kill yet
-      continue;
-    }
-
-    if (now - newest >= staleThreshold) {
-      killTree(pid);
-      try {
-        fs.unlinkSync(statePath);
-        fs.unlinkSync(pidPath);
-      } catch {
-        // already gone — fine
-      }
-      writeKillNote(statePath, {
-        pid,
-        command,
-        display: base,
-        stalledMs: now - newest,
-        killedAt: new Date().toISOString(),
-      });
-    }
-  }
-}
+/** True while at least one handoff is still being tracked. */
 
 function main(): void {
   const opts = readOptions();
+  if (!opts) process.exit(1);
+
   // Acquire the lock: if another runner holds it (alive), exit quietly so we
-  // never double-kill or duplicate. The spawner wrote the pid optimistically;
-  // verify it is actually us or a live predecessor.
+  // never double-kill or duplicate. The spawner wrote our pid optimistically;
+  // a different live pid means a predecessor is still watching.
   try {
-    const lockPid = Number((fs.readFileSync(opts.lockPath, "utf-8").trim().match(/\d+/) || [])[0]);
+    const lockPid = Number(
+      (fs.readFileSync(opts.lockPath, "utf-8").trim().match(/\d+/) || [])[0],
+    );
     if (lockPid > 0 && lockPid !== process.pid && isAlive(lockPid)) {
       process.exit(0);
     }
     fs.writeFileSync(opts.lockPath, String(process.pid), "utf-8");
   } catch {
-    // lock write failed — run anyway (single-instance is best-effort)
+    // lock write failed - run anyway (single-instance is best-effort)
   }
 
-  const timer = setInterval(() => scanOnce(opts), Math.max(opts.pollMs, 1000));
+  const poll = Math.max(opts.pollMs, 1000);
+  const scan = (): void => {
+    void scanOnce({
+      dir: opts.dir,
+      stalledAfterMs: opts.stalledAfterMs,
+      healthTimeoutMs: opts.healthTimeoutMs,
+    }).catch(() => {
+      // a scan failure must never kill the runner
+    });
+  };
+
+  const timer = setInterval(scan, poll);
 
   const finish = (): void => {
     clearInterval(timer);
+    clearInterval(idleTimer);
     releaseLock(opts);
     process.exit(0);
   };
@@ -166,20 +96,15 @@ function main(): void {
   process.on("SIGTERM", finish);
   process.on("exit", () => releaseLock(opts));
 
-  // Stop once nothing is tracked, so no idle process is left behind.
+  // Stop once nothing LIVE is tracked, so no idle process is left behind.
+  // A sidecar for a dead server does not count: the lazy probe announces DIED
+  // and removes it, and the runner must not outlive its usefulness waiting.
   const idleTimer = setInterval(() => {
-    try {
-      const any = fs
-        .readdirSync(opts.dir)
-        .some((f) => f.toLowerCase().endsWith(".state.json"));
-      if (!any) finish();
-    } catch {
-      finish();
-    }
-  }, Math.max(opts.pollMs, 1000));
+    if (!hasLiveTrackedServers(opts.dir)) finish();
+  }, poll);
 
-  // first pass so a dead pid file gets a kill prompt to expire lazily
-  setTimeout(() => scanOnce(opts), 500);
+  // First pass shortly after start.
+  setTimeout(scan, 500);
 }
 
 main();

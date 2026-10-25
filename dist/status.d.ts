@@ -55,6 +55,11 @@ export interface ServerSidecar {
     errLog: string;
     healthUrl?: string;
     /**
+     * Where `healthUrl` came from. A `refused` result against a GUESSED preset
+     * port is not evidence of a sick server, only of a wrong guess.
+     */
+    healthSource?: "config" | "preset" | "log";
+    /**
      * Effective probe URL. Starts as the rewrite-time guess (`healthUrl`), then
      * is replaced by the address the server printed in its own logs when one is
      * discovered (a moved port, dual-stack bind, etc.). Persisted so an UNHEALTHY

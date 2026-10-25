@@ -1,4 +1,17 @@
 import type { ServerStartGuardConfig } from "./types.js";
+/**
+ * Commands that may already be a safe, non-hanging server start:
+ *   - Windows: ONLY this plugin's own launcher (Win32_Process.Create). A
+ *     hand-written `Start-Process ... -RedirectStandard*` is NOT safe: handle
+ *     inheritance leaks the tool's stdout pipe write-end into the detached
+ *     tree, so the bash call stays open while the server lives (measured: a
+ *     4s child held a piped caller for 4.6s; the same child launched via
+ *     Win32_Process.Create returned in 0.2s).
+ *   - POSIX: a nohup background job that already redirects a stream and ends
+ *     with `&` is considered detached. A bare `nohup server` (no redirect, no
+ *     `&`) is NOT — it still inherits the tool's pipes.
+ */
+export declare function isAlreadySafe(command: string, isWindows?: boolean): boolean;
 /** True when a command string matches any server-start pattern. */
 export declare function detect(command: string, cfg: ServerStartGuardConfig): boolean;
 /**

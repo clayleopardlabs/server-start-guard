@@ -25,7 +25,7 @@ You are done.
 The server command is rewritten into a detached form with its output redirected to log files, so the `bash` call returns immediately:
 
 - **Windows:** the command is handed to a fresh `pwsh` (encoded, base64 UTF-16LE) which is started through `Win32_Process.Create`. That starts the new process with no inherited handles, so nothing in the new process tree can hold the assistant's output pipe open. The new process sends its own output and errors to the log files and records its pid.
-- **macOS / Linux:** the command is single-quote-escaped and run as `nohup sh -c '<command>' </dev/null >out.log 2>err.log &`, with the job's pid captured to a `.pid` file.
+- **macOS / Linux:** the command is single-quote-escaped and run as `nohup sh -c '<command>' </dev/null >out.log 2>err.log &`, and the server writes its own pid to a `.pid` file.
 
 Logs land in `%TMP%\opencode\server-logs` (Windows) or `os.tmpdir()/opencode/server-logs` (POSIX), or a custom `logDir` from the config.
 
@@ -49,14 +49,14 @@ Health probing is last-successful-response based: the guard tracks *when the las
 3. A built-in guess for well-known dev servers (vite, Angular, Next, Python/uvicorn/django, and a few more).
 4. None of the above: pure pid + log monitoring.
 
-Every probe also covers **both loopback address families** (IPv4 `127.0.0.1` and IPv6 `::1`), so a server that binds only one family is still reachable. A timeout is recorded as a distinct failure kind from a refused connection, but neither one by itself declares a server unhealthy. Only the stale last-successful-response clock does.
+Every probe also covers **both loopback address families** (IPv4 `127.0.0.1` and IPv6 `::1`), so a server that binds only one family is still reachable. A timeout is recorded as a distinct failure kind from a refused connection, but neither one by itself declares a server unhealthy. Only the stale last-successful-response clock does. If nothing answers a guessed port, that is treated as a wrong guess, not a sick server, because a dev server often moves to another port.
 
 ## No more stuck agents
 
 Two mechanisms make sure an agent can never wait for hours again:
 
 1. **A hard time limit on every bash command.** The guard always sets the bash tool's own timeout. A command that is rewritten as a server start gets a short bound (default 15 seconds), because a working detached start returns in milliseconds. Every other command gets a ceiling (default 10 minutes). This limit is a backstop, not the fix. A call can outlive its limit when the started program still holds the assistant's pipe. The real fix is that the new process tree holds none of the assistant's pipes.
-2. **A separate watchdog process.** The lazy status probe only runs when the agent runs a bash command. If the agent stops issuing commands, a quiet-but-alive server could hold its port forever with nobody looking. To close that gap, the guard starts one detached helper process (outside the agent entirely, with no connection to any tool pipe). It checks the tracking files every 10 seconds, and force-kills any tracked server whose logs say nothing for 5 minutes. It writes a small note next to the removed tracking files, and the next bash command reports "server KILLED by watchdog". It stops itself when no servers are left to watch.
+2. **A separate watchdog process.** The lazy status probe only runs when the agent runs a bash command. If the agent stops issuing commands, a quiet-but-alive server could hold its port forever with nobody looking. To close that gap, the guard starts one detached helper process (outside the agent entirely, with no connection to any tool pipe). It checks the tracking files every 10 seconds, and force-kills any tracked server whose logs say nothing for 5 minutes. Before killing, it asks the server once: a quiet server that still answers HTTP is left alone. It writes a small note next to the removed tracking files, and the next bash command reports "server KILLED by watchdog". It stops itself when no running server is left to watch.
 
 ## Configuration
 

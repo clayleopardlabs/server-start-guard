@@ -38,8 +38,21 @@ export const ServerStartGuardPlugin = async () => {
                 return;
             const workdir = typeof output.args?.workdir === "string" ? output.args.workdir : undefined;
             let cmd = command;
-            if (detect(command, cfg)) {
-                cmd = rewrite(command, cfg, workdir);
+            let rewritten = false;
+            try {
+                if (detect(command, cfg)) {
+                    cmd = rewrite(command, cfg, workdir);
+                    rewritten = true;
+                }
+            }
+            catch {
+                // A throw here would block the user's command entirely (a failing
+                // tool.execute.before hook aborts the spawn). Degrade to running the
+                // command exactly as typed, with the normal ceiling.
+                cmd = command;
+                rewritten = false;
+            }
+            if (rewritten) {
                 // A rewritten command must return almost immediately. This bound is
                 // insurance against a broken rewrite, not a cap on the server itself.
                 output.args.timeout = cfg.detachTimeoutMs;
@@ -60,16 +73,26 @@ export const ServerStartGuardPlugin = async () => {
             // health + kill-notes), then prepends only literal echo/Write-Output
             // lines announcing CHANGES.
             const dir = resolveLogDir(cfg);
-            const announcements = await probeServers(dir, cfg);
-            announcements.push(...readKillNotes(dir));
-            cmd = buildProbeEcho(announcements, cmd, isWindows());
-            // 1. Detached watchdog. Spawn (once per log dir) an external node process
-            // that force-kills servers whose logs stay silent for
-            // watchdogStalledAfterMs — regardless of whether the agent ever issues
-            // another bash command. The watchdog runs with stdio ignored and .unref()
-            // so it can never block an agent's tool pipe. Kill-notes it writes are
+            try {
+                const announcements = await probeServers(dir, cfg);
+                announcements.push(...readKillNotes(dir));
+                cmd = buildProbeEcho(announcements, cmd, isWindows());
+            }
+            catch {
+                // Observability must never break the user's command: a probe bug
+                // costs an announcement, not the bash call.
+            }
+            // 1. Detached watchdog. Spawn (once per log dir, and only while servers
+            // are tracked) an external process that force-kills servers that are
+            // both log-silent and not answering HTTP - regardless of whether the
+            // agent ever issues another bash command. Kill-notes it writes are
             // consumed above by readKillNotes on the next bash call.
-            ensureWatchdog(dir, cfg);
+            try {
+                ensureWatchdog(dir, cfg);
+            }
+            catch {
+                // same rule as above: never fail the bash call over the watchdog
+            }
             output.args.command = cmd;
         },
     };

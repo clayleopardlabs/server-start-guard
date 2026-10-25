@@ -23,10 +23,20 @@ export interface ProbablePort {
     url: string;
 }
 /**
+ * A probe URL plus where it came from. The source matters: a `refused` result
+ * against a GUESSED preset port is not evidence that the server is sick, it is
+ * only evidence that the guess was wrong (the server may be on another port).
+ * A `refused` against a configured or log-discovered URL is real.
+ */
+export interface ResolvedHealthUrl {
+    url: string;
+    source: "config" | "preset";
+}
+/**
  * Resolve a health-check URL for a command, or undefined when nothing
  * sensible matches (the server will get PID/log monitoring only).
  */
-export declare function resolveHealthUrl(command: string, cfg: ServerStartGuardConfig): string | undefined;
+export declare function resolveHealthUrl(command: string, cfg: ServerStartGuardConfig): ResolvedHealthUrl | undefined;
 /** Result kinds of one health probe. */
 export type HttpProbeKind = "ok" | "broken" | "refused" | "timeout";
 export interface HttpProbeResult {
@@ -42,6 +52,10 @@ export interface HttpProbeResult {
  * trying N+1" before the real line. Only loopback URLs are accepted — a
  * process that prints a public address is serving it from somewhere we
  * may not be able to reach, so guessing worse is not helpful.
+ *
+ * Only the origin is captured (scheme + loopback host + port): anything after
+ * it in the log line is a path, and probing a path would test the route
+ * instead of the server.
  */
 export declare function discoverBoundUrl(outLog: string | undefined, errLog: string | undefined): string | undefined;
 /**

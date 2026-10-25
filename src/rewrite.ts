@@ -55,47 +55,92 @@ function shq(s: string): string {
  *     with `&` is considered detached. A bare `nohup server` (no redirect, no
  *     `&`) is NOT — it still inherits the tool's pipes.
  */
-function isAlreadySafe(command: string): boolean {
-  if (IS_WINDOWS) {
+export function isAlreadySafe(command: string, isWindows = IS_WINDOWS): boolean {
+  if (isWindows) {
     return /Win32_Process/i.test(command) && /-MethodName\s+Create\b/i.test(command);
   }
-  return (
-    /\bnohup\b/i.test(command) &&
-    /[0-9]?[<>]/.test(command) &&
-    /&\s*(?:#.*)?$/m.test(command)
-  );
+  // The whole command must already be a detached background job: a nohup that
+  // redirects BOTH streams AND ends with a single trailing `&`. The end-of-
+  // command test is deliberate - a multi-line script whose first line is a
+  // detached job and whose last line is a foreground server start is NOT safe.
+  // Both streams matter: redirecting only stdout leaves stderr on the tool's
+  // pipe (and vice versa), which holds the call open exactly like no redirect.
+  const trimmed = command.trim();
+  const endsBackground = /(?<![&>])&(?:\s*#.*)?\s*$/.test(trimmed);
+  const hasNohup = /\bnohup\b/.test(trimmed);
+  const both = /&>/.test(trimmed);
+  const stdoutRedirected = both || /(?<![0-9&])>(?!&)\s*\S/.test(trimmed);
+  const stderrRedirected = both || /2>&1|2>\s*\S/.test(trimmed);
+  // `2>&1 > out.log` sends stderr to whatever stdout was BEFORE the redirect,
+  // i.e. the tool's pipe - the same leak as redirecting only one stream.
+  const errFirst = trimmed.search(/2>&1/);
+  const outFirst = trimmed.search(/(?<![0-9&])>(?!&)/);
+  const outOfOrder = errFirst >= 0 && outFirst >= 0 && errFirst < outFirst;
+  return hasNohup && endsBackground && stdoutRedirected && stderrRedirected && !outOfOrder;
+}
+
+/**
+ * Matches a shell command position: the start of the command, or the spot just
+ * after a separator (`;`, `&&`, `||`, `|`, `(`, newline), plus leading
+ * environment assignments and common wrappers (`sudo`, `npx`, `timeout 30`...).
+ *
+ * Without this anchor, a pattern like `/\bvite\b/` also fires on
+ * `cat vite.config.ts`, `git log --grep vite` and `rg Start-Process`, and
+ * silently moves a read-only command's output into a log file.
+ */
+const CMD_START =
+  String.raw`(?:^|[;&|(\n]\s*)` +
+  String.raw`(?:(?:[A-Za-z_][A-Za-z0-9_]*=\S*|--?[\w-]+(?:=\S+)?|sudo(?:\s+-u\s+\S+)?|doas|npx|bunx|pnpx|env|exec|command|nice(?:\s+-n\s+\S+)?|cross-env|timeout\s+\S+|(?:ba|z|k)?sh\s+-[lc]+|cmd\s+/c|wsl(?:\s+(?:-\S+|--\S+)(?:\s+\S+)?)*\s+(?:--|-e|--exec)|wsl\s+\S+|(?:pnpm|yarn)\s+(?:exec|dlx))\s+)*` +
+  String.raw`["']?` +
+  String.raw`(?:(?:\.{1,2}[\\/]|[A-Za-z]:[\\/]|\\\\)[\w.\\/-]*[\\/])?`;
+
+/** Anchor a program-name pattern to a command position. */
+function atStart(source: string): RegExp {
+  return new RegExp(CMD_START + source, "im");
 }
 
 /** Conservative, high-confidence server-start patterns (case-insensitive). */
 const BASE_PATTERNS: RegExp[] = [
-  // Explicit daemonization markers
-  /\bStart-Process\b/i,
-  /\bnohup\b/i,
-  // Command-level backgrounding (a trailing & )
-  /[;&]\s*&\s*(?:#.*)?$/m,
-  // Known long-running dev/server runners
-  /\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:dev|start|serve|preview)\b/i,
-  /\b(?:npm|pnpm|yarn|bun)\s+start\b/i,
-  /\buvicorn\b/i,
-  /\bgunicorn\b/i,
-  /\bflask\s+run\b/i,
-  /django[\w.:/-]*\s+runserver\b/i,
-  /\brunserver\b/i,
-  /\bmanage\.py\s+runserver\b/i,
-  /\bpython(?:3(?:\.\d+)?)?\s+-m\s+(?:http\.server|uvicorn|flask|django)\b/i,
-  /\bpython(?:3(?:\.\d+)?)?\s+[\w./\\-]*(?:server|app|serve)\.py\b/i,
-  /\bnode\s+[\w./\\-]*(?:server|app|main)[\w.-]*\.(?:js|mjs|cjs|ts|mts|cts)\b/i,
-  /\bgo\s+run\s+[\w./\\-]*server\.go\b/i,
-  /\bdotnet\s+run\b/i,
-  /\bjava\s+-jar\b/i,
-  /\bdocker[- ]compose\s+up\b/i,
-  /\bng\s+serve\b/i,
-  /\bngrok\b/i,
-  /\bvite\b/i,
-  /\bnext\s+dev\b/i,
-  /\bastro\s+dev\b/i,
-  /\bwebpack(\s+serve|-(?:dev-server|serve))\b/i,
-  /\b\.\/(?:dev|server|serve|launch|run|start)[\w./\\-]*\.(?:sh|bat|cmd)\b/i,
+  // Explicit daemonization / process-creation markers.
+  atStart(String.raw`Start-Process\b`),
+  atStart(String.raw`nohup\b`),
+  // A single trailing `&` at the very end of the command (not `&&`, not `2>&1`).
+  /(?<![&>])&(?:\s*#.*)?\s*$/,
+  // Package-manager script runners.
+  atStart(String.raw`(?:npm|pnpm|yarn|bun)\s+(?:--?[\w-]+(?:\s+\S+)?\s+)*(?:run\s+)?(?:dev|start|serve|preview|watch)\b`),
+  atStart(String.raw`(?:npm|pnpm|yarn|bun)\s+run\s+dev:[\w-]+\b`),
+  // Node / Python / Go / .NET / Java / Ruby / Elixir servers and watchers.
+  atStart(String.raw`(?:nodemon|ts-node-dev|tsx\s+watch|node\s+--watch)\b`),
+  atStart(String.raw`uvicorn\b`),
+  atStart(String.raw`gunicorn\b`),
+  atStart(String.raw`hypercorn\b`),
+  atStart(String.raw`flask\s+(?:--app\s+\S+\s+)?run\b`),
+  atStart(String.raw`django[\w.:/-]*\s+runserver\b`),
+  atStart(String.raw`runserver\b`),
+  atStart(String.raw`(?:[\w.\\/-]*[\\/])?(?:python(?:3(?:\.\d+)?)?\s+|py\s+)?(?:[\w.\\/-]*[\\/])?manage\.py\s+runserver\b`),
+  atStart(String.raw`python(?:3(?:\.\d+)?)?\s+-m\s+(?:http\.server|uvicorn|flask|django)\b`),
+  atStart(String.raw`python(?:3(?:\.\d+)?)?\s+[\w./\\-]*(?:server|app|serve)\.py\b`),
+  atStart(String.raw`node\s+[\w./\\-]*(?:server|app|main)[\w.-]*\.(?:js|mjs|cjs|ts|mts|cts)\b`),
+  atStart(String.raw`go\s+run\s+[\w./\\-]*server\.go\b`),
+  atStart(String.raw`dotnet\s+(?:run|watch)\b`),
+  atStart(String.raw`java\s+-jar\b`),
+  atStart(String.raw`cargo\s+(?:run|watch)\b`),
+  atStart(String.raw`mix\s+phx\.server\b`),
+  atStart(String.raw`rails\s+(?:s|server)\b`),
+  atStart(String.raw`php\s+-S\b`),
+  // Static-file servers.
+  atStart(String.raw`(?:http-server|live-server|serve)\b`),
+  // Containers / tunnels.
+  atStart(String.raw`docker[- ]compose\s+up\b`),
+  atStart(String.raw`ngrok\b`),
+  // Frontend dev servers.
+  atStart(String.raw`ng\s+serve\b`),
+  atStart(String.raw`vite\b`),
+  atStart(String.raw`next\s+dev\b`),
+  atStart(String.raw`nuxt\s+dev\b`),
+  atStart(String.raw`astro\s+dev\b`),
+  atStart(String.raw`webpack(\s+serve|-(?:dev-server|serve))\b`),
+  atStart(String.raw`\.\/(?:dev|server|serve|launch|run|start)[\w./\\-]*\.(?:sh|bat|cmd)\b`),
 ];
 
 /** True when a command string matches any server-start pattern. */
@@ -149,11 +194,20 @@ export function buildPosixCommand(
   cwd: string,
   pidPath: string,
 ): string {
+  // The pid is recorded by the CHILD, not from `$!` of the launching shell:
+  // `$!` is the subshell that ran `cd ... && nohup ...`, so killing it leaves
+  // the real server alive and still holding the port. `$$` inside the job is
+  // the pid of the process that actually runs the command.
+  const inner = `echo $$ > '${shq(pidPath)}'; ${command}`;
+  // `setsid` (Linux/WSL) makes the job a session and process-group leader, so
+  // the watchdog can kill the whole tree with `kill -<pid>`. macOS has no
+  // setsid binary; there the runner falls back to pkill -P + kill.
   return (
     `echo '[server-start-guard] detached server start -> ${shq(outLog)}'; ` +
-    `cd '${shq(cwd)}' && nohup sh -c '${shq(command)}' ` +
-    `</dev/null >'${shq(outLog)}' 2>'${shq(errLog)}' & PID=$!; ` +
-    `echo "$PID" > '${shq(pidPath)}'`
+    `cd '${shq(cwd)}' || exit 1; ` +
+    `if command -v setsid >/dev/null 2>&1; then SSG_SETSID=setsid; else SSG_SETSID=; fi; ` +
+    `nohup $SSG_SETSID sh -c '${shq(inner)}' ` +
+    `</dev/null >'${shq(outLog)}' 2>'${shq(errLog)}' &`
   );
 }
 
@@ -191,10 +245,26 @@ export function buildWindowsCommand(
   ].join("\r\n");
   const encoded = Buffer.from(script, "utf16le").toString("base64");
 
+  // CreateProcess caps a command line at 32,767 characters and base64 UTF-16LE
+  // is about 2.67x the source, so a very large command would fail inside
+  // Win32_Process.Create. For those, write the payload to a .ps1 beside the
+  // logs and launch it with -File (a locally created script still runs under
+  // the machine's RemoteSigned policy).
+  let launch = `pwsh -NoProfile -EncodedCommand ${encoded}`;
+  if (encoded.length > 12000) {
+    const scriptPath = outLog.replace(/\.out\.log$/i, ".ps1");
+    try {
+      fs.writeFileSync(scriptPath, script, "utf-8");
+      launch = `pwsh -NoProfile -File '${q(scriptPath)}'`;
+    } catch {
+      // fall back to the encoded form; it may fail, but nothing is lost
+    }
+  }
+
   return (
     `Write-Output '[server-start-guard] detached server start -> ${q(outLog)}'; ` +
     `$ssg = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ ` +
-    `CommandLine = 'pwsh -NoProfile -EncodedCommand ${encoded}'; ` +
+    `CommandLine = '${q(launch)}'; ` +
     `CurrentDirectory = '${q(cwd)}' }; ` +
     `if ($ssg.ReturnValue -ne 0) { throw "server-start-guard: Win32_Process.Create failed ($($ssg.ReturnValue))" }; ` +
     `$ssg.ProcessId | Out-File -Encoding 'ascii' '${q(pidPath)}'`
@@ -219,13 +289,21 @@ export function rewrite(
     typeof workdir === "string" && workdir.trim() !== ""
       ? workdir
       : process.cwd();
-  const ts = Date.now();
+  // Two detaches of the same command inside one millisecond would otherwise
+  // share a sidecar/pid/log set and overwrite each other.
   const stem = baseName(command);
+  let ts = Date.now();
+  while (
+    fs.existsSync(stateFilePath(dir, stem, ts)) ||
+    fs.existsSync(pidFilePath(dir, stem, ts))
+  ) {
+    ts++;
+  }
   const outLog = path.join(dir, `${stem}-${ts}.out.log`);
   const errLog = path.join(dir, `${stem}-${ts}.err.log`);
   const pidPath = pidFilePath(dir, stem, ts);
 
-  const healthUrl = resolveHealthUrl(command, cfg);
+  const health = resolveHealthUrl(command, cfg);
 
   writeSidecar(stateFilePath(dir, stem, ts), {
     command,
@@ -233,7 +311,7 @@ export function rewrite(
     startedAt: new Date().toISOString(),
     outLog,
     errLog,
-    ...(healthUrl ? { healthUrl } : {}),
+    ...(health ? { healthUrl: health.url, healthSource: health.source } : {}),
   });
 
   if (IS_WINDOWS) {

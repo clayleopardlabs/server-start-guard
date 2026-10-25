@@ -4,25 +4,25 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import type { ServerStartGuardConfig } from "./types.js";
 import { isAlive } from "./pid.js";
+import { hasLiveTrackedServers, scanOnce } from "./watch.js";
+
 
 /**
  * The external watchdog.
  *
  * Problem it solves: the lazy probe only runs inside a `bash` call. If the
  * agent goes away or stops issuing commands, a wedged server (alive but
- * silent — a recompile hang, a bound-but-deaf socket, a stray process) can sit
- * forever holding its port, invisible to the agent's next command. For the
- * "stuck for hours" failure the watch must exist OUTSIDE the agent.
+ * silent, or alive and answering nothing) can sit forever holding its port.
+ * For the "stuck for hours" failure the watch must exist OUTSIDE the agent.
  *
- * Solution: `ensureWatchdog` spawns a detached node process (the runner in
- * `watchdog-runner.ts`) with stdio fully ignored, so nothing it does can ever
+ * Solution: `ensureWatchdog` spawns a detached JavaScript runtime running
+ * `watchdog-runner.js` with stdio fully ignored, so nothing it does can ever
  * block or be blocked by an agent's tool pipe. The runner scans the state dir
- * every `watchdogPollMs`; any tracked server whose logs have been silent for
- * `watchdogStalledAfterMs` is force-killed (taskkill /T on Windows to take the
- * whole tree, SIGKILL elsewhere) and a kill-note is written beside the state
- * file. The next probe reads kill-notes and announces them like any other
- * transition, then removes them. The runner exits when no state files remain,
- * so no idle process is left behind.
+ * every `watchdogPollMs`; a tracked server that has been log-silent for
+ * `watchdogStalledAfterMs` AND is not answering HTTP is force-killed, and a
+ * kill-note is written beside the state file. The next probe reads kill-notes
+ * and announces them like any other transition, then removes them. The runner
+ * exits when no state files remain, so no idle process is left behind.
  *
  * Single-instance: a `.watchdog.pid` lock file in the log dir records the
  * runner's pid; `ensureWatchdog` reuses a live runner and only spawns one when
@@ -51,11 +51,84 @@ export function watchdogRunning(dir: string): boolean {
   }
 }
 
+/** Look a program up on PATH without spawning anything. */
+function findOnPath(name: string): string | undefined {
+  const exts = process.platform === "win32" ? [".exe", ".cmd", ".bat", ""] : [""];
+  const dirs = (process.env.PATH ?? "").split(path.delimiter);
+  for (const dir of dirs) {
+    if (!dir) continue;
+    for (const ext of exts) {
+      const candidate = path.join(dir, name + ext);
+      try {
+        if (fs.statSync(candidate).isFile()) return candidate;
+      } catch {
+        // keep looking
+      }
+    }
+  }
+  return undefined;
+}
+
 /**
- * Ensure a detached watchdog runner is watching `dir`. Spawns via the current
- * node binary with stdio detached+ignored and `.unref()` so the child cannot
- * pin the opencode process or inherit its pipes. Returns the child when one was
- * spawned, undefined when a runner already existed or spawning was disabled.
+ * Resolve a JavaScript runtime that can execute the runner.
+ *
+ * `process.execPath` must NOT be used blindly: the plugin runs inside
+ * opencode's compiled binary, so execPath is `opencode.exe`. Spawning that with
+ * a `.js` argument starts a second copy of opencode, which never runs the
+ * runner, so the watchdog silently does not exist (and leaves a stray process
+ * behind). Only accept execPath when it really is node/bun.
+ */
+export function resolveRunnerRuntime(): string | undefined {
+  const explicit = process.env.SSG_NODE_PATH;
+  if (explicit && fs.existsSync(explicit)) return explicit;
+
+  const fromNpm = process.env.npm_node_execpath;
+  if (fromNpm && fs.existsSync(fromNpm)) return fromNpm;
+
+  const exe = path.basename(process.execPath).toLowerCase();
+  if (exe === "node.exe" || exe === "node" || exe === "bun.exe" || exe === "bun") {
+    return process.execPath;
+  }
+
+  return findOnPath("node") ?? findOnPath("bun");
+}
+
+/** In-process fallback runners, keyed by log dir. */
+const inProcess = new Map<string, NodeJS.Timeout>();
+
+/**
+ * Last-resort watch that needs no child process: a single unref'd interval in
+ * the plugin's own process. Only used when no runtime can be spawned, and it
+ * stops itself once nothing is tracked.
+ */
+function ensureInProcessWatch(dir: string, cfg: ServerStartGuardConfig): void {
+  if (inProcess.has(dir)) return;
+  const timer = setInterval(() => {
+    // Never let a scan failure escape: this runs inside the plugin host, where
+    // an unhandled rejection is fatal.
+    scanOnce({
+      dir,
+      stalledAfterMs: cfg.watchdogStalledAfterMs,
+      healthTimeoutMs: cfg.healthTimeoutMs,
+    }).catch(() => {});
+    try {
+      if (!hasLiveTrackedServers(dir)) {
+        clearInterval(timer);
+        inProcess.delete(dir);
+      }
+    } catch {
+      clearInterval(timer);
+      inProcess.delete(dir);
+    }
+  }, Math.max(cfg.watchdogPollMs, 1000));
+  timer.unref?.();
+  inProcess.set(dir, timer);
+}
+
+/**
+ * Ensure a detached watchdog runner is watching `dir`. Returns the child when
+ * one was spawned, undefined when a runner already existed, nothing is
+ * tracked, or spawning was disabled.
  */
 export function ensureWatchdog(
   dir: string,
@@ -67,33 +140,56 @@ export function ensureWatchdog(
   } catch {
     return undefined;
   }
+  // Nothing tracked means nothing to watch. Without this gate every bash call
+  // in a fresh session would try to start a runner.
+  if (!hasLiveTrackedServers(dir)) return undefined;
   if (watchdogRunning(dir)) return undefined;
 
   const runner = runnerScriptPath();
   if (!fs.existsSync(runner)) return undefined;
 
+  const runtime = resolveRunnerRuntime();
+  if (!runtime) {
+    ensureInProcessWatch(dir, cfg);
+    return undefined;
+  }
+
   const options = JSON.stringify({
     dir,
     pollMs: cfg.watchdogPollMs,
     stalledAfterMs: cfg.watchdogStalledAfterMs,
+    healthTimeoutMs: cfg.healthTimeoutMs,
     lockPath: lockPath(dir),
   });
 
-  // If the runner dies without removing the lock, the stale pid check above
-  // lets a future spawn replace it.
+  let child: ChildProcess;
+  try {
+    child = spawn(runtime, [runner, options], {
+      detached: true,
+      stdio: "ignore",
+      windowsHide: true,
+    });
+  } catch {
+    ensureInProcessWatch(dir, cfg);
+    return undefined;
+  }
 
-  const child = spawn(process.execPath, [runner, options], {
-    detached: true,
-    stdio: "ignore",
-    windowsHide: true,
+  // Spawn failures are asynchronous. Without a listener a missing runtime
+  // would raise an uncaught exception inside the opencode process.
+  child.on("error", () => {
+    ensureInProcessWatch(dir, cfg);
   });
   child.unref();
 
-  try {
-    fs.writeFileSync(lockPath(dir), String(child.pid ?? ""), "utf-8");
-  } catch {
-    // lock write failure: the runner will still work, but the next
-    // ensureWatchdog may spawn a duplicate — acceptable
+  if (typeof child.pid === "number" && child.pid > 0) {
+    try {
+      fs.writeFileSync(lockPath(dir), String(child.pid), "utf-8");
+    } catch {
+      // lock write failure: the runner still works, the next call may spawn a
+      // duplicate that exits on its own lock check - acceptable
+    }
+  } else {
+    ensureInProcessWatch(dir, cfg);
   }
   return child;
 }
