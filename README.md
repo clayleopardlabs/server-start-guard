@@ -69,6 +69,7 @@ Settings live in `~/.config/opencode/plugins/server-start-guard/config.json` and
 - `watchdogEnabled` (bool, default `true`): turn the detached watchdog on or off.
 - `watchdogPollMs` (number, default `10000`): how often the watchdog checks the tracking files.
 - `watchdogStalledAfterMs` (number, default `300000`): how long a server's logs must stay silent before the watchdog force-kills it.
+- `watchdogNodePath` (string, default empty): the full path to `node.exe` (or `bun`) used to start the watchdog. Leave empty to let the guard search. Set it when the guard reports that it found no runtime, which happens when the host hides its `PATH`.
 - `extraPatterns` (string[]): extra substrings; any command containing one is treated as a server start.
 - `healthChecks` (array of `{ "pattern": "...", "url": "..." }`): explicit health-check URLs. The first rule whose pattern appears in the command wins, e.g. to probe your custom port:
   ```json
@@ -80,6 +81,16 @@ Settings live in `~/.config/opencode/plugins/server-start-guard/config.json` and
 - `healthTimeoutMs` (default `2000`): how long each health request may take before it is recorded as a timeout.
 - `healthIntervalMs` (default `15000`): minimum time between health probes of the same server.
 - `healthGraceMs` (default `30000`): how long after startup to wait before the first probe, so a slow-starting server isn't flagged.
+
+## If the watchdog is not running
+
+The guard writes one line to `.watchdog.log` in the log folder whenever it cannot start the detached watchdog. Read that file first. The usual line is `no JS runtime found`, which means the host hid its `PATH`. Fix it by setting `watchdogNodePath` to your `node.exe`, for example:
+
+```json
+"watchdogNodePath": "C:\\Program Files\\nodejs\\node.exe"
+```
+
+Until then the guard still watches servers, but only while the agent is running, because the fallback timer lives inside the assistant process.
 
 ## How to remove
 

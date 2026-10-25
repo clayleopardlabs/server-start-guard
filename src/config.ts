@@ -10,6 +10,7 @@ function defaults(): ServerStartGuardConfig {
     watchdogEnabled: true,
     watchdogPollMs: 10 * 1000,
     watchdogStalledAfterMs: 5 * 60 * 1000,
+    watchdogNodePath: "",
     extraPatterns: [],
     healthChecks: [],
     defaultHealthChecks: true,
@@ -36,6 +37,7 @@ export function readConfig(): ServerStartGuardConfig {
       if (typeof raw.watchdogEnabled === "boolean") cfg.watchdogEnabled = raw.watchdogEnabled;
       if (typeof raw.watchdogPollMs === "number" && raw.watchdogPollMs > 0) cfg.watchdogPollMs = raw.watchdogPollMs;
       if (typeof raw.watchdogStalledAfterMs === "number" && raw.watchdogStalledAfterMs > 0) cfg.watchdogStalledAfterMs = raw.watchdogStalledAfterMs;
+      if (typeof raw.watchdogNodePath === "string") cfg.watchdogNodePath = raw.watchdogNodePath.trim();
       if (Array.isArray(raw.extraPatterns)) {
         cfg.extraPatterns = raw.extraPatterns.filter((p) => typeof p === "string");
       }

@@ -33,8 +33,14 @@ export declare function watchdogRunning(dir: string): boolean;
  * a `.js` argument starts a second copy of opencode, which never runs the
  * runner, so the watchdog silently does not exist (and leaves a stray process
  * behind). Only accept execPath when it really is node/bun.
+ *
+ * PATH cannot be trusted either: opencode hands plugins a stripped environment
+ * (measured on this machine: `PATH` held exactly one entry), so a PATH-only
+ * lookup finds no runtime and the watchdog quietly degrades to the in-process
+ * timer, which dies with the agent. Hence the explicit setting and the
+ * well-known install locations below.
  */
-export declare function resolveRunnerRuntime(): string | undefined;
+export declare function resolveRunnerRuntime(explicitPath?: string): string | undefined;
 /**
  * Ensure a detached watchdog runner is watching `dir`. Returns the child when
  * one was spawned, undefined when a runner already existed, nothing is

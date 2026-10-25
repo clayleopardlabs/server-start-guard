@@ -1,4 +1,5 @@
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { spawn, type ChildProcess } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -69,6 +70,16 @@ function findOnPath(name: string): string | undefined {
   return undefined;
 }
 
+/** A path that exists and is a regular file, or undefined. */
+function existingFile(candidate: string | undefined): string | undefined {
+  if (!candidate) return undefined;
+  try {
+    return fs.statSync(candidate).isFile() ? candidate : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /**
  * Resolve a JavaScript runtime that can execute the runner.
  *
@@ -77,20 +88,59 @@ function findOnPath(name: string): string | undefined {
  * a `.js` argument starts a second copy of opencode, which never runs the
  * runner, so the watchdog silently does not exist (and leaves a stray process
  * behind). Only accept execPath when it really is node/bun.
+ *
+ * PATH cannot be trusted either: opencode hands plugins a stripped environment
+ * (measured on this machine: `PATH` held exactly one entry), so a PATH-only
+ * lookup finds no runtime and the watchdog quietly degrades to the in-process
+ * timer, which dies with the agent. Hence the explicit setting and the
+ * well-known install locations below.
  */
-export function resolveRunnerRuntime(): string | undefined {
-  const explicit = process.env.SSG_NODE_PATH;
-  if (explicit && fs.existsSync(explicit)) return explicit;
-
-  const fromNpm = process.env.npm_node_execpath;
-  if (fromNpm && fs.existsSync(fromNpm)) return fromNpm;
+export function resolveRunnerRuntime(explicitPath = ""): string | undefined {
+  for (const candidate of [
+    explicitPath,
+    process.env.SSG_NODE_PATH,
+    process.env.npm_node_execpath,
+  ]) {
+    const hit = existingFile(candidate);
+    if (hit) return hit;
+  }
 
   const exe = path.basename(process.execPath).toLowerCase();
   if (exe === "node.exe" || exe === "node" || exe === "bun.exe" || exe === "bun") {
     return process.execPath;
   }
 
-  return findOnPath("node") ?? findOnPath("bun");
+  const onPath = findOnPath("node") ?? findOnPath("bun");
+  if (onPath) return onPath;
+
+  // Well-known install locations. The branch that matters when PATH is
+  // stripped, which is the normal case inside opencode.
+  const exeDir = path.dirname(process.execPath);
+  const candidates: string[] = [
+    path.join(exeDir, "node.exe"),
+    path.join(exeDir, "node"),
+    path.join(exeDir, "bun.exe"),
+    path.join(exeDir, "bun"),
+  ];
+  const programFiles = process.env.ProgramFiles;
+  const localAppData = process.env.LOCALAPPDATA;
+  const appData = process.env.APPDATA;
+  if (programFiles) candidates.push(path.join(programFiles, "nodejs", "node.exe"));
+  if (localAppData) {
+    candidates.push(path.join(localAppData, "Programs", "nodejs", "node.exe"));
+    candidates.push(path.join(localAppData, "Programs", "bun", "bun.exe"));
+  }
+  if (appData) {
+    candidates.push(path.join(appData, "npm", "node.exe"));
+    candidates.push(path.join(appData, "npm", "bun.exe"));
+  }
+  candidates.push(path.join(os.homedir(), ".bun", "bin", "bun.exe"));
+
+  for (const candidate of candidates) {
+    const hit = existingFile(candidate);
+    if (hit) return hit;
+  }
+  return undefined;
 }
 
 /**
@@ -189,11 +239,11 @@ export function ensureWatchdog(
     return undefined;
   }
 
-  const runtime = resolveRunnerRuntime();
+  const runtime = resolveRunnerRuntime(cfg.watchdogNodePath);
   if (!runtime) {
     logSpawnIssue(
       dir,
-      `no JS runtime found (execPath ${process.execPath}, PATH entries ${(process.env.PATH ?? "").split(path.delimiter).length}); using in-process watch`,
+      `no JS runtime found (execPath ${process.execPath}, PATH entries ${(process.env.PATH ?? "").split(path.delimiter).length}, watchdogNodePath "${cfg.watchdogNodePath}"); using in-process watch`,
     );
     ensureInProcessWatch(dir, cfg);
     return undefined;

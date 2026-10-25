@@ -64,6 +64,14 @@ export interface ServerStartGuardConfig {
    * indefinitely.
    */
   watchdogStalledAfterMs: number;
+  /**
+   * Explicit path to the JavaScript runtime used to launch the detached
+   * watchdog runner. Needed because opencode runs plugins with a stripped
+   * PATH (measured: a single entry), so a PATH lookup for `node` finds
+   * nothing and the watchdog silently degrades to the in-process timer. Empty
+   * means "search the usual locations".
+   */
+  watchdogNodePath: string;
   /** Optional extra regex substrings of additional commands to treat as servers. */
   extraPatterns: string[];
   /**
