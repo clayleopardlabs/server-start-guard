@@ -93,6 +93,29 @@ export function resolveRunnerRuntime(): string | undefined {
   return findOnPath("node") ?? findOnPath("bun");
 }
 
+/**
+ * Record why no detached runner was started, in a file beside the logs.
+ *
+ * Everything in this module degrades silently by design (the hook must never
+ * break a command), and a spawn that fails leaves no trace at all: its stdio is
+ * ignored. That silence is how "the watchdog is not running" stayed invisible
+ * for several sessions, so a failure path now writes one line. Successful and
+ * uninteresting paths (nothing tracked, runner already alive) stay quiet.
+ */
+function logSpawnIssue(dir: string, reason: string): void {
+  try {
+    const p = path.join(dir, ".watchdog.log");
+    try {
+      if (fs.statSync(p).size > 8192) fs.writeFileSync(p, "", "utf-8");
+    } catch {
+      // absent: first write
+    }
+    fs.appendFileSync(p, `${new Date().toISOString()} ${reason}\n`, "utf-8");
+  } catch {
+    // a diagnostic that cannot be written must never surface as an error
+  }
+}
+
 /** In-process fallback runners, keyed by log dir. */
 const inProcess = new Map<string, NodeJS.Timeout>();
 
@@ -142,7 +165,10 @@ export function ensureWatchdog(
   dir: string,
   cfg: ServerStartGuardConfig,
 ): ChildProcess | undefined {
-  if (!cfg.watchdogEnabled) return undefined;
+  if (!cfg.watchdogEnabled) {
+    logSpawnIssue(dir, "not started: watchdogEnabled is false");
+    return undefined;
+  }
   try {
     fs.mkdirSync(dir, { recursive: true });
   } catch {
@@ -158,10 +184,17 @@ export function ensureWatchdog(
   if (watchdogRunning(dir)) return undefined;
 
   const runner = runnerScriptPath();
-  if (!fs.existsSync(runner)) return undefined;
+  if (!fs.existsSync(runner)) {
+    logSpawnIssue(dir, `not started: runner script missing at ${runner}`);
+    return undefined;
+  }
 
   const runtime = resolveRunnerRuntime();
   if (!runtime) {
+    logSpawnIssue(
+      dir,
+      `no JS runtime found (execPath ${process.execPath}, PATH entries ${(process.env.PATH ?? "").split(path.delimiter).length}); using in-process watch`,
+    );
     ensureInProcessWatch(dir, cfg);
     return undefined;
   }
@@ -191,14 +224,16 @@ export function ensureWatchdog(
       stdio: "ignore",
       windowsHide: true,
     });
-  } catch {
+  } catch (err) {
+    logSpawnIssue(dir, `spawn threw for ${runtime}: ${String(err)}; using in-process watch`);
     ensureInProcessWatch(dir, cfg);
     return undefined;
   }
 
   // Spawn failures are asynchronous. Without a listener a missing runtime
   // would raise an uncaught exception inside the opencode process.
-  child.on("error", () => {
+  child.on("error", (err) => {
+    logSpawnIssue(dir, `spawn error for ${runtime}: ${String(err)}; using in-process watch`);
     ensureInProcessWatch(dir, cfg);
   });
   child.unref();
@@ -216,6 +251,7 @@ export function ensureWatchdog(
     // in-process watch if it did not survive.
     setTimeout(() => {
       if (isAlive(pid)) return;
+      logSpawnIssue(dir, `runner ${runtime} pid ${pid} died within 500ms; using in-process watch`);
       runnerDead.add(dir);
       try {
         fs.unlinkSync(lockPath(dir));
@@ -225,6 +261,7 @@ export function ensureWatchdog(
       ensureInProcessWatch(dir, cfg);
     }, 500).unref?.();
   } else {
+    logSpawnIssue(dir, `spawn of ${runtime} produced no pid; using in-process watch`);
     ensureInProcessWatch(dir, cfg);
   }
   return child;
