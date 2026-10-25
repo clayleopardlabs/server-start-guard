@@ -268,16 +268,33 @@ export function ensureWatchdog(
   }
 
   let child: ChildProcess;
+  // The runner's stderr goes to a file, not the void: with SSG_DEBUG=1 it prints
+  // every scan decision, and "the watchdog is not running" is exactly the class
+  // of failure that stayed invisible while its output was discarded.
+  let errFd: number | undefined;
+  try {
+    errFd = fs.openSync(path.join(dir, "runner.err.log"), "a");
+  } catch {
+    errFd = undefined;
+  }
   try {
     child = spawn(runtime, [runner, dir], {
       detached: true,
-      stdio: "ignore",
+      stdio: ["ignore", "ignore", errFd ?? "ignore"],
       windowsHide: true,
     });
   } catch (err) {
     logSpawnIssue(dir, `spawn threw for ${runtime}: ${String(err)}; using in-process watch`);
     ensureInProcessWatch(dir, cfg);
     return undefined;
+  } finally {
+    if (errFd !== undefined) {
+      try {
+        fs.closeSync(errFd);
+      } catch {
+        // the child holds its own duplicate
+      }
+    }
   }
 
   // Spawn failures are asynchronous. Without a listener a missing runtime

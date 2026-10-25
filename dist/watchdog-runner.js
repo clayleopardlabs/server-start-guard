@@ -73,17 +73,38 @@ function main() {
         // lock write failed - run anyway (single-instance is best-effort)
     }
     const poll = Math.max(opts.pollMs, 1000);
-    const scan = () => {
-        void scanOnce({
-            dir: opts.dir,
-            stalledAfterMs: opts.stalledAfterMs,
-            healthTimeoutMs: opts.healthTimeoutMs,
-        }).catch(() => {
+    // A scan is asynchronous: after a kill it waits up to 2 s for the process to
+    // disappear before it removes the sidecar and writes the KILLED note. The
+    // idle check below must never run during that window, or it sees a dead pid,
+    // decides there is nothing left to watch, and exits - losing the note and
+    // leaving the sidecar for the lazy probe to report as a plain DIED.
+    let scanning = false;
+    let finished = false;
+    const scan = async () => {
+        if (scanning)
+            return;
+        scanning = true;
+        try {
+            await scanOnce({
+                dir: opts.dir,
+                stalledAfterMs: opts.stalledAfterMs,
+                healthTimeoutMs: opts.healthTimeoutMs,
+            });
+        }
+        catch {
             // a scan failure must never kill the runner
-        });
+        }
+        finally {
+            scanning = false;
+        }
     };
-    const timer = setInterval(scan, poll);
+    const timer = setInterval(() => {
+        void scan();
+    }, poll);
     const finish = () => {
+        if (finished)
+            return;
+        finished = true;
         clearInterval(timer);
         clearInterval(idleTimer);
         releaseLock(opts);
@@ -96,11 +117,15 @@ function main() {
     // A sidecar for a dead server does not count: the lazy probe announces DIED
     // and removes it, and the runner must not outlive its usefulness waiting.
     const idleTimer = setInterval(() => {
+        if (scanning)
+            return;
         if (!hasLiveTrackedServers(opts.dir))
             finish();
     }, poll);
     // First pass shortly after start.
-    setTimeout(scan, 500);
+    setTimeout(() => {
+        void scan();
+    }, 500);
 }
 main();
 //# sourceMappingURL=watchdog-runner.js.map

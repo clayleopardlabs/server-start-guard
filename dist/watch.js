@@ -224,7 +224,9 @@ export async function scanOnce(opts) {
         let gone = false;
         for (let i = 0; i < 10; i++) {
             await new Promise((r) => setTimeout(r, 200));
-            if (!isAliveStrict(pid)) {
+            const strictAlive = isAliveStrict(pid);
+            dbg("verify", i, "pid", pid, "alive", strictAlive);
+            if (!strictAlive) {
                 gone = true;
                 break;
             }

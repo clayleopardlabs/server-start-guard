@@ -92,6 +92,8 @@ The guard writes one line to `.watchdog.log` in the log folder whenever it canno
 
 Until then the guard still watches servers, but only while the agent is running, because the fallback timer lives inside the assistant process.
 
+To see what the helper itself decided, start opencode with `SSG_DEBUG=1` set. Its notes then go to `runner.err.log` in the same log folder.
+
 ## How to remove
 
 1. Delete this folder.

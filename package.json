@@ -4,7 +4,7 @@
   "type": "module",
   "scripts": {
     "build": "tsc",
-    "verify": "node verify/leakregress.mjs && node verify/runtime.mjs && node verify/detect.mjs"
+    "verify": "node verify/leakregress.mjs && node verify/runtime.mjs && node verify/runner.mjs && node verify/detect.mjs"
   },
   "dependencies": {
     "@opencode-ai/plugin": "^1.17.5"
