@@ -256,6 +256,18 @@ export async function scanOnce(opts: WatchOptions): Promise<void> {
     }
 
     dbg("kill verified, pid gone:", gone);
+    // Note FIRST, sidecar second. The reverse order has a silent failure mode:
+    // if anything stops the runner between the unlink and the note, the server
+    // is gone, no note exists, and the lazy probe reports a plain DIED - a kill
+    // that looks like a crash. A stray note beside a leftover sidecar is the
+    // harmless direction (the probe reports KILLED and removes the note).
+    writeKillNote(statePath, {
+      pid,
+      command,
+      display: base,
+      stalledMs: now - newest,
+      killedAt: new Date().toISOString(),
+    });
     try {
       fs.unlinkSync(statePath);
     } catch {
@@ -266,12 +278,5 @@ export async function scanOnce(opts: WatchOptions): Promise<void> {
     } catch {
       // already gone - fine
     }
-    writeKillNote(statePath, {
-      pid,
-      command,
-      display: base,
-      stalledMs: now - newest,
-      killedAt: new Date().toISOString(),
-    });
   }
 }
