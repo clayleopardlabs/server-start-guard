@@ -6,6 +6,15 @@ A simple add-on for opencode. It stops your AI assistant from getting stuck when
 
 When the assistant starts a long running program like a server, this add-on quietly moves that program to run in the background. The assistant keeps working instead of waiting forever.
 
+In plain terms:
+
+1. **It spots server starts.** Before a command runs, it checks whether the command looks like starting a server, such as `npm run dev` or `vite`.
+2. **It launches it in the background.** It rewrites the command so the server runs on its own and writes its output to log files. The assistant gets control back in a fraction of a second instead of waiting.
+3. **It keeps an eye on what it started.** On each later command it checks whether the server is still running, still writing to its log, and still answering web requests. If something changed it says so once, for example that the server died, or that it stopped responding and later recovered.
+4. **It cleans up stuck servers.** A small helper runs outside the assistant. If a server has been silent for minutes and does not answer web requests, it kills it so the port is freed instead of being blocked for hours.
+
+It is a safety net, not a server manager. It does not restart things, change ports, or decide what should run. It only makes starting a server safe for the assistant and tells it when a server it started has gone wrong.
+
 ## How to install
 
 **Windows**
